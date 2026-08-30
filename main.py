@@ -101,7 +101,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.0.2-v3"
+VERSION = "2.0.3-v3"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -699,55 +699,61 @@ class NewsFilter:
 
     def refresh(self) -> None:
         self.last_refresh = time.time()
-        events = self._fetch_investing()
-        if not events:
-            raise RuntimeError("Investing nao retornou eventos 3 estrelas")
+        source = "INVESTING_3STAR"
+        try:
+            events = self._fetch_investing()
+        except Exception as investing_error:
+            logger.warning("NEWS | Investing indisponivel | %s | tentando ForexFactory", investing_error)
+            events = self._fetch_forexfactory()
+            source = "FOREXFACTORY_HIGH"
         with self._lock:
             manual = [e for e in self.events if e.get("source") == "MANUAL"]
             self.events = events + manual
             self.last_success = time.time()
             atomic_json_write(NEWS_CACHE_FILE, {"last_success": self.last_success, "events": self.events})
-        logger.info("NEWS | cache atualizado | eventos_high=%s", len(events))
+        logger.info("NEWS | cache atualizado | fonte=%s | eventos_high=%s", source, len(events))
 
     def _fetch_investing(self) -> List[Dict[str, Any]]:
         if BeautifulSoup is None:
             raise RuntimeError("beautifulsoup4 ausente")
-        # Public webpage; Investing does not expose a documented public API. We parse
-        # only timestamp/title/high-impact markers and retain cache if page changes.
-        url = "https://www.investing.com/economic-calendar/"
+        # The visible calendar page is client-rendered and may contain no event rows.
+        # Its own calendar service returns the HTML fragment used by the page. Request
+        # GMT explicitly so data-event-datetime can be interpreted safely as UTC.
+        url = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": "https://www.investing.com/economic-calendar/",
         }
-        r = requests.get(url, headers=headers, timeout=15)
+        today = datetime.now(UTC).date()
+        end = today + timedelta(days=NEWS_LOOKAHEAD_DAYS)
+        form = [
+            ("importance[]", "3"),
+            ("timeZone", "55"),
+            ("timeFilter", "timeOnly"),
+            ("currentTab", "custom"),
+            ("limit_from", "0"),
+            ("dateFrom", today.isoformat()),
+            ("dateTo", end.isoformat()),
+        ]
+        r = requests.post(url, headers=headers, data=form, timeout=20)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        payload = r.json()
+        if not isinstance(payload, dict) or "data" not in payload:
+            raise RuntimeError("resposta inesperada do calendario Investing")
+        soup = BeautifulSoup(str(payload.get("data", "")), "html.parser")
         events: List[Dict[str, Any]] = []
         horizon = datetime.now(UTC) + timedelta(days=NEWS_LOOKAHEAD_DAYS)
-        # Legacy + current variants. High impact commonly exposed as sentiment-3/bull3.
-        rows = soup.find_all(["tr", "article", "div"])
+        rows = soup.find_all("tr", attrs={"data-event-datetime": True})
         for row in rows:
             txt = " ".join(row.stripped_strings)
-            cls = " ".join(row.get("class", []) if hasattr(row, "get") else [])
             html = str(row)[:5000]
-            high = bool(re.search(r"sentiment[-_ ]?3|bull3|high[ -]?impact|three[ -]?stars|3-star", cls + " " + html, re.I))
-            if not high:
-                # aria labels sometimes carry importance.
-                high = "High Volatility Expected" in txt
+            high = bool(re.search(r"bull3|High Volatility Expected|sentiment[-_ ]?3", html, re.I))
             if not high:
                 continue
-            raw_dt = None
-            for attr in ("data-event-datetime", "data-datetime", "datetime"):
-                if hasattr(row, "get") and row.get(attr):
-                    raw_dt = row.get(attr)
-                    break
-                node = row.find(attrs={attr: True}) if hasattr(row, "find") else None
-                if node:
-                    raw_dt = node.get(attr)
-                    break
-            if not raw_dt:
-                m = re.search(r'data-event-datetime=["\']([^"\']+)', html)
-                raw_dt = m.group(1) if m else None
+            raw_dt = row.get("data-event-datetime")
             if not raw_dt:
                 continue
             dt = self._parse_investing_dt(raw_dt)
@@ -755,12 +761,41 @@ class NewsFilter:
                 continue
             if dt < datetime.now(UTC) - timedelta(hours=2) or dt > horizon:
                 continue
-            title = txt[:240] or "High-impact event"
+            event_cell = row.find("td", class_=lambda c: c and "event" in (c if isinstance(c, list) else str(c)).split())
+            title = " ".join(event_cell.stripped_strings)[:240] if event_cell else txt[:240]
             events.append({"ts": dt.timestamp(), "title": title, "source": "INVESTING_3STAR"})
         # dedupe
         unique = {}
         for e in events:
             unique[(round(float(e["ts"])), e["title"][:80])] = e
+        return sorted(unique.values(), key=lambda x: x["ts"])
+
+    def _fetch_forexfactory(self) -> List[Dict[str, Any]]:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        headers = {"User-Agent": f"{BOT_NAME}/{VERSION}", "Accept": "application/json"}
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+        if not isinstance(payload, list):
+            raise RuntimeError("resposta inesperada do calendario ForexFactory")
+        now = datetime.now(UTC)
+        horizon = now + timedelta(days=NEWS_LOOKAHEAD_DAYS)
+        events: List[Dict[str, Any]] = []
+        for item in payload:
+            if str(item.get("impact", "")).strip().lower() != "high":
+                continue
+            try:
+                dt = datetime.fromisoformat(str(item.get("date", "")).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=UTC)
+                dt = dt.astimezone(UTC)
+            except Exception:
+                continue
+            if dt < now - timedelta(hours=2) or dt > horizon:
+                continue
+            title = f"{item.get('country', '')} | {item.get('title', 'High-impact event')}"[:240]
+            events.append({"ts": dt.timestamp(), "title": title, "source": "FOREXFACTORY_HIGH"})
+        unique = {(round(float(e["ts"])), e["title"][:80]): e for e in events}
         return sorted(unique.values(), key=lambda x: x["ts"])
 
     @staticmethod
