@@ -39,9 +39,11 @@ Dependencias:
   pip install requests websocket-client beautifulsoup4
 
 Variaveis principais Railway:
-  ASTER_API_KEY=...
-  ASTER_SECRET_KEY=...
+  ASTER_USER_ADDRESS=0x...              # carteira principal/login Aster
+  ASTER_API_WALLET_ADDRESS=0x...        # endereço público da API Wallet autorizada
+  ASTER_API_WALLET_PRIVATE_KEY=0x...    # chave privada SOMENTE da API Wallet
   LIVE_TRADING=0
+  VALIDATE_API_ONLY=1
   BOT_DIR=/data
   MAX_REQUESTED_LEVERAGE=150
   INITIAL_BANKROLL_USD=10
@@ -52,13 +54,13 @@ Variaveis principais Railway:
   NEWS_FILTER_ENABLED=1
   NEWS_FAIL_CLOSED=1
 
-Nao coloque seed phrase da Trust Wallet no Railway. Use API key/secret criados na Aster.
+Nao coloque seed phrase nem chave privada da Trust Wallet principal no Railway.
+Use somente a chave privada da API Wallet dedicada e autorizada na Aster.
 """
 
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import logging
 import math
@@ -78,6 +80,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
+from eth_account import Account
+from eth_account.messages import encode_typed_data
 
 try:
     import websocket  # websocket-client
@@ -97,13 +101,15 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "1.0.0"
-BOT_NAME = "ASTER_PERPETUAL_BOT_V1"
-BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
+VERSION = "2.0.0-v3"
+BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
+BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi3.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
-API_KEY = os.getenv("ASTER_API_KEY", "").strip()
-SECRET_KEY = os.getenv("ASTER_SECRET_KEY", "").strip()
+USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
+SIGNER_ADDRESS = os.getenv("ASTER_API_WALLET_ADDRESS", "").strip()
+SIGNER_PRIVATE_KEY = os.getenv("ASTER_API_WALLET_PRIVATE_KEY", "").strip()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
+VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = BOT_DIR / "state.json"
@@ -295,23 +301,36 @@ class AsterAPIError(RuntimeError):
 
 
 class AsterClient:
-    def __init__(self, api_key: str, secret: str):
-        self.api_key = api_key
-        self.secret = secret.encode()
+    def __init__(self, user_address: str, signer_address: str, signer_private_key: str):
+        self.user_address = user_address
+        self.signer_address = signer_address
+        self.signer_private_key = signer_private_key
+        if self.signer_private_key:
+            derived = Account.from_key(self.signer_private_key).address
+            if self.signer_address and derived.lower() != self.signer_address.lower():
+                raise AsterAPIError(
+                    f"ASTER_API_WALLET_PRIVATE_KEY nao corresponde a ASTER_API_WALLET_ADDRESS "
+                    f"(derivado={derived})"
+                )
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": f"{BOT_NAME}/{VERSION}"})
-        if api_key:
-            self.s.headers.update({"X-MBX-APIKEY": api_key})
         self.time_offset_ms = 0
         self.api_error_streak = 0
         self._lock = threading.Lock()
+        self._last_nonce = 0
 
     def _ts(self) -> int:
         return now_ms() + self.time_offset_ms
 
+    def _nonce(self) -> int:
+        with self._lock:
+            candidate = self._ts() * 1000
+            self._last_nonce = max(candidate, self._last_nonce + 1)
+            return self._last_nonce
+
     def sync_time(self) -> None:
         t0 = now_ms()
-        r = self.s.get(BASE_URL + "/fapi/v1/time", timeout=HTTP_TIMEOUT)
+        r = self.s.get(BASE_URL + "/fapi/v3/time", timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         server = int(r.json()["serverTime"])
         t1 = now_ms()
@@ -323,13 +342,14 @@ class AsterClient:
                  signed: bool = False, api_key_only: bool = False, retry_unknown: bool = False) -> Any:
         params = dict(params or {})
         if signed:
-            if not self.api_key or not SECRET_KEY:
-                raise AsterAPIError("ASTER_API_KEY/ASTER_SECRET_KEY ausentes")
-            params.setdefault("recvWindow", RECV_WINDOW)
-            params["timestamp"] = self._ts()
+            if not self.user_address or not self.signer_address or not self.signer_private_key:
+                raise AsterAPIError("Credenciais da API Wallet V3 ausentes")
+            params["nonce"] = self._nonce()
+            params["signer"] = self.signer_address
             qs = urlencode([(k, str(v).lower() if isinstance(v, bool) else str(v)) for k, v in params.items()])
-            sig = hmac.new(self.secret, qs.encode(), hashlib.sha256).hexdigest()
-            params["signature"] = sig
+            typed_data = {"types": {"EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"}, {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}], "Message": [{"name": "msg", "type": "string"}]}, "primaryType": "Message", "domain": {"name": "AsterSignTransaction", "version": "1", "chainId": 1666, "verifyingContract": "0x0000000000000000000000000000000000000000"}, "message": {"msg": qs}}
+            signable = encode_typed_data(full_message=typed_data)
+            params["signature"] = Account.sign_message(signable, private_key=self.signer_private_key).signature.hex()
         url = BASE_URL + path
         try:
             r = self.s.request(method, url, params=params, timeout=HTTP_TIMEOUT)
@@ -355,27 +375,27 @@ class AsterClient:
 
     # Public
     def exchange_info(self) -> Dict[str, Any]:
-        return self._request("GET", "/fapi/v1/exchangeInfo")
+        return self._request("GET", "/fapi/v3/exchangeInfo")
 
     def price(self, symbol: str) -> Decimal:
-        x = self._request("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
+        x = self._request("GET", "/fapi/v3/ticker/price", {"symbol": symbol})
         return dec(x.get("price"))
 
     def mark(self, symbol: str) -> Decimal:
-        x = self._request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
+        x = self._request("GET", "/fapi/v3/premiumIndex", {"symbol": symbol})
         return dec(x.get("markPrice") or x.get("price"))
 
     def klines(self, symbol: str, interval: str, limit: int = 100) -> List[List[Any]]:
-        return self._request("GET", "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        return self._request("GET", "/fapi/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
 
     # Signed
     def position_mode(self) -> bool:
-        x = self._request("GET", "/fapi/v1/positionSide/dual", signed=True)
+        x = self._request("GET", "/fapi/v3/positionSide/dual", signed=True)
         return bool(x.get("dualSidePosition"))
 
     def set_hedge_mode(self) -> None:
         try:
-            self._request("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "true"}, signed=True)
+            self._request("POST", "/fapi/v3/positionSide/dual", {"dualSidePosition": "true"}, signed=True)
         except AsterAPIError as e:
             # "No need to change" type errors are harmless; verify afterwards.
             if e.code not in (-4059,):
@@ -383,35 +403,35 @@ class AsterClient:
 
     def set_margin_type(self, symbol: str, isolated: bool = True) -> None:
         try:
-            self._request("POST", "/fapi/v1/marginType",
+            self._request("POST", "/fapi/v3/marginType",
                           {"symbol": symbol, "marginType": "ISOLATED" if isolated else "CROSSED"}, signed=True)
         except AsterAPIError as e:
             if e.code not in (-4046,):  # no need to change margin type
                 raise
 
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        return self._request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(leverage)}, signed=True)
+        return self._request("POST", "/fapi/v3/leverage", {"symbol": symbol, "leverage": int(leverage)}, signed=True)
 
     def leverage_bracket(self, symbol: str) -> Any:
-        return self._request("GET", "/fapi/v1/leverageBracket", {"symbol": symbol}, signed=True)
+        return self._request("GET", "/fapi/v3/leverageBracket", {"symbol": symbol}, signed=True)
 
     def balance(self) -> Any:
         # Binance-compatible endpoint used by Aster Pro API.
-        return self._request("GET", "/fapi/v2/balance", signed=True)
+        return self._request("GET", "/fapi/v3/balance", signed=True)
 
     def account(self) -> Any:
-        return self._request("GET", "/fapi/v2/account", signed=True)
+        return self._request("GET", "/fapi/v3/accountWithJoinMargin", signed=True)
 
     def positions(self, symbol: Optional[str] = None) -> Any:
         p = {"symbol": symbol} if symbol else {}
-        return self._request("GET", "/fapi/v2/positionRisk", p, signed=True)
+        return self._request("GET", "/fapi/v3/positionRisk", p, signed=True)
 
     def open_orders(self, symbol: Optional[str] = None) -> Any:
         p = {"symbol": symbol} if symbol else {}
-        return self._request("GET", "/fapi/v1/openOrders", p, signed=True)
+        return self._request("GET", "/fapi/v3/openOrders", p, signed=True)
 
     def query_order(self, symbol: str, client_id: str) -> Dict[str, Any]:
-        return self._request("GET", "/fapi/v1/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
+        return self._request("GET", "/fapi/v3/order", {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
 
     def order(self, symbol: str, side: str, position_side: str, quantity: Decimal,
               client_id: str, order_type: str = "MARKET") -> Dict[str, Any]:
@@ -425,7 +445,7 @@ class AsterClient:
             "newOrderRespType": "RESULT",
         }
         try:
-            return self._request("POST", "/fapi/v1/order", p, signed=True)
+            return self._request("POST", "/fapi/v3/order", p, signed=True)
         except AsterAPIError as e:
             if e.code == 503:
                 # Never blindly retry. Reconcile first using deterministic client id.
@@ -438,7 +458,7 @@ class AsterClient:
             raise
 
     def cancel_all(self, symbol: str) -> Any:
-        return self._request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
+        return self._request("DELETE", "/fapi/v3/allOpenOrders", {"symbol": symbol}, signed=True)
 
     def income(self, symbol: Optional[str] = None, start_ms: Optional[int] = None, limit: int = 1000) -> Any:
         p: Dict[str, Any] = {"limit": limit}
@@ -446,7 +466,7 @@ class AsterClient:
             p["symbol"] = symbol
         if start_ms:
             p["startTime"] = start_ms
-        return self._request("GET", "/fapi/v1/income", p, signed=True)
+        return self._request("GET", "/fapi/v3/income", p, signed=True)
 
 # -----------------------------------------------------------------------------
 # EXCHANGE SYMBOL RULES
@@ -1573,7 +1593,7 @@ class Reconciler:
 class Bot:
     def __init__(self):
         self.stop = threading.Event()
-        self.client = AsterClient(API_KEY, SECRET_KEY)
+        self.client = AsterClient(USER_ADDRESS, SIGNER_ADDRESS, SIGNER_PRIVATE_KEY)
         self.store = StateStore()
         self.rules = RulesBook(self.client)
         self.md = MarketData(self.client)
@@ -1595,10 +1615,20 @@ class Bot:
         logger.info("NEWS 3-STAR=%s | janela=-%sm/+%sm | fail_closed=%s", NEWS_FILTER_ENABLED, NEWS_WINDOW_BEFORE_MIN, NEWS_WINDOW_AFTER_MIN, NEWS_FAIL_CLOSED)
         logger.info("SAME_SYMBOL_MULTI_STRATEGY=%s (0 preserva contabilidade exata da posicao agregada Aster)", ALLOW_MULTI_STRATEGY_SAME_SYMBOL)
         logger.info("=" * 90)
-        if LIVE_TRADING and (not API_KEY or not SECRET_KEY):
-            raise RuntimeError("LIVE_TRADING=1 requer ASTER_API_KEY e ASTER_SECRET_KEY")
+        if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
+            raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
         self.client.sync_time()
         self.rules.refresh()
+        if VALIDATE_API_ONLY:
+            mode = self.client.position_mode()
+            balances = self.client.balance()
+            account = self.client.account()
+            positions = self.client.positions()
+            logger.info("API V3 VALIDADA | signer=%s | hedge=%s | balances=%s | positions=%s | canTrade=%s",
+                        SIGNER_ADDRESS, mode, len(balances) if isinstance(balances, list) else 0,
+                        len(positions) if isinstance(positions, list) else 0,
+                        account.get("canTrade") if isinstance(account, dict) else None)
+            return
         if LIVE_TRADING:
             self.account.ensure_modes()
             self.account.sync(force=True)
@@ -1656,6 +1686,10 @@ class Bot:
 
     def run(self) -> None:
         self.startup()
+        if VALIDATE_API_ONLY:
+            logger.info("VALIDATE_API_ONLY concluido; encerrando sem alterar configuracoes e sem enviar ordens")
+            self.shutdown()
+            return
         while not self.stop.is_set():
             try:
                 if self.client.api_error_streak >= KILL_SWITCH_ON_API_ERRORS and self.store.killed() == "OFF":
