@@ -52,7 +52,9 @@ Variaveis principais Railway:
   BTC_INITIAL_OPERATION_NOTIONAL_USD=100
   MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT=0.05
   RECOVERY_MULTIPLIER=4
-  MAX_RECOVERY_FAILURES=3
+  MAX_RECOVERY_FAILURES=2
+  EMERGENCY_CLOSE_ALL_AND_RESET=0
+  EMERGENCY_RESET_ID=reset-20260830-01
   MACD_TAKE_PROFIT_PCT=0.01
   MACD_HARD_STOP_PCT=0.02
   NEWS_FILTER_ENABLED=1
@@ -105,7 +107,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.3.1-v3"
+VERSION = "2.4.0-v3"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -114,6 +116,8 @@ SIGNER_ADDRESS = os.getenv("ASTER_API_WALLET_ADDRESS", "").strip()
 SIGNER_PRIVATE_KEY = os.getenv("ASTER_API_WALLET_PRIVATE_KEY", "").strip()
 LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
 VALIDATE_API_ONLY = os.getenv("VALIDATE_API_ONLY", "0") == "1"
+EMERGENCY_CLOSE_ALL_AND_RESET = os.getenv("EMERGENCY_CLOSE_ALL_AND_RESET", "0") == "1"
+EMERGENCY_RESET_ID = os.getenv("EMERGENCY_RESET_ID", "reset-20260830-01").strip()
 BOT_DIR = Path(os.getenv("BOT_DIR", "/data"))
 BOT_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = BOT_DIR / "state.json"
@@ -134,7 +138,7 @@ INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv(
 BTC_INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv("BTC_INITIAL_OPERATION_NOTIONAL_USD", "100"))
 MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT = D(os.getenv("MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT", "0.05"))
 RECOVERY_MULTIPLIER = D(os.getenv("RECOVERY_MULTIPLIER", "4"))
-MAX_RECOVERY_FAILURES = int(os.getenv("MAX_RECOVERY_FAILURES", "3"))
+MAX_RECOVERY_FAILURES = int(os.getenv("MAX_RECOVERY_FAILURES", "2"))
 
 MAX_REQUESTED_LEVERAGE = int(os.getenv("MAX_REQUESTED_LEVERAGE", "35"))
 API_HARD_MAX_LEVERAGE = 125
@@ -920,6 +924,7 @@ def fresh_state() -> Dict[str, Any]:
         "macd": {f"{s}:{tf}": empty_macd_state(s, tf) for s in SYMBOLS for tf in MACD_TIMEFRAMES},
         "symbol_owner": {s: None for s in SYMBOLS},
         "last_wallet": {},
+        "maintenance": {"completed_emergency_actions": []},
     }
 
 
@@ -941,6 +946,7 @@ class StateStore:
         st.setdefault("macd", {})
         st.setdefault("symbol_owner", {})
         st.setdefault("last_wallet", {})
+        st.setdefault("maintenance", {"completed_emergency_actions": []})
         for s in SYMBOLS:
             st["range"].setdefault(s, empty_range_state(s))
             st["symbol_owner"].setdefault(s, None)
@@ -1872,6 +1878,8 @@ class Bot:
         if LIVE_TRADING:
             self.account.ensure_modes()
             self.account.sync(force=True)
+            if EMERGENCY_CLOSE_ALL_AND_RESET:
+                self.emergency_close_all_and_reset()
             self.reconciler.reconcile()
         else:
             logger.warning("MODO SIMULACAO: nenhuma ordem real sera enviada")
@@ -1882,6 +1890,85 @@ class Bot:
             self.macd_engines = [MacdEngine(s, tf, self.client, self.md, self.news, self.account, self.exe, self.store)
                                  for s in SYMBOLS for tf in MACD_TIMEFRAMES]
         self.md.start(); self.news.start()
+
+    def emergency_close_all_and_reset(self) -> None:
+        """Acao idempotente: cancela ordens, zera TODAS as posicoes e recria o estado."""
+        maintenance = self.store.state.setdefault("maintenance", {"completed_emergency_actions": []})
+        completed = maintenance.setdefault("completed_emergency_actions", [])
+        completed_ids = {
+            str(x.get("id")) if isinstance(x, dict) else str(x)
+            for x in completed
+        }
+        if EMERGENCY_RESET_ID in completed_ids:
+            logger.warning("EMERGENCY RESET | id=%s ja concluido; nenhuma ordem repetida", EMERGENCY_RESET_ID)
+            return
+
+        logger.critical(
+            "EMERGENCY RESET INICIO | id=%s | cancelando TODAS as ordens e fechando TODAS as posicoes da conta",
+            EMERGENCY_RESET_ID,
+        )
+        open_orders = self.client.open_orders()
+        positions = self.client.positions()
+        symbols = {
+            str(x.get("symbol", "")).upper()
+            for x in (open_orders if isinstance(open_orders, list) else [])
+            if x.get("symbol")
+        }
+        symbols.update(
+            str(x.get("symbol", "")).upper()
+            for x in (positions if isinstance(positions, list) else [])
+            if x.get("symbol") and abs(dec(x.get("positionAmt"))) > 0
+        )
+        for symbol in sorted(symbols):
+            self.client.cancel_all(symbol)
+            logger.warning("EMERGENCY RESET | ordens canceladas | %s", symbol)
+
+        for p in (positions if isinstance(positions, list) else []):
+            qty = abs(dec(p.get("positionAmt")))
+            if qty <= 0:
+                continue
+            symbol = str(p.get("symbol", "")).upper()
+            position_side = str(p.get("positionSide", "")).upper()
+            if position_side not in ("LONG", "SHORT"):
+                raise RuntimeError(f"EMERGENCY RESET encontrou positionSide invalido: {p}")
+            mark = dec(p.get("markPrice") or p.get("entryPrice") or 0)
+            logger.critical(
+                "EMERGENCY CLOSE | symbol=%s strategy_owner=%s side=%s qty=%s entry=%s mark=%s notional=%s unreal=%s",
+                symbol, self.store.state.get("symbol_owner", {}).get(symbol), position_side, qty,
+                p.get("entryPrice"), p.get("markPrice"), abs(dec(p.get("notional") or qty * mark)),
+                p.get("unRealizedProfit") or p.get("unrealizedProfit"),
+            )
+            self.exe.market("EMERGENCY_RESET", symbol, position_side, qty, False, mark)
+
+        remaining = []
+        for _ in range(5):
+            time.sleep(1)
+            remaining = [
+                p for p in self.client.positions()
+                if abs(dec(p.get("positionAmt"))) > 0
+            ]
+            if not remaining:
+                break
+        if remaining:
+            raise RuntimeError(
+                "EMERGENCY RESET NAO CONFIRMADO; posicoes restantes="
+                + str([(p.get("symbol"), p.get("positionSide"), p.get("positionAmt")) for p in remaining])
+            )
+
+        reset = fresh_state()
+        reset["maintenance"]["completed_emergency_actions"] = [{
+            "id": EMERGENCY_RESET_ID,
+            "completed_at": now_iso(),
+            "action": "CLOSE_ALL_POSITIONS_CANCEL_ALL_ORDERS_AND_RESET_STATE",
+        }]
+        with self.store.lock:
+            self.store.state = reset
+            self.store.save()
+        self.account.sync(force=True)
+        logger.critical(
+            "EMERGENCY RESET CONCLUIDO | id=%s | posicoes=0 | ordens=0 | estado zerado | novas entradas usam notional base configurado",
+            EMERGENCY_RESET_ID,
+        )
 
     def hard_kill(self) -> None:
         if not LIVE_TRADING:
@@ -1923,6 +2010,61 @@ class Bot:
         logger.info("HEARTBEAT | wallet=%s avail=%s unreal=%s | kill=%s:%s | %s",
                     self.account.wallet_balance, self.account.available_balance, self.account.unrealized,
                     ks.get("mode"), ks.get("reason"), " | ".join(parts))
+        if LIVE_TRADING:
+            try:
+                self.log_open_positions_detailed()
+            except Exception as e:
+                logger.warning("OPEN POSITION DETAIL FAIL | %s", e)
+
+    def log_open_positions_detailed(self) -> None:
+        """Mostra estratégia proprietária, exposição, alvo e stop de cada posição real."""
+        positions = self.client.positions()
+        found = 0
+        with self.store.lock:
+            owners = dict(self.store.state.get("symbol_owner", {}))
+            state_range = self.store.state.get("range", {})
+            state_macd = self.store.state.get("macd", {})
+        for p in (positions if isinstance(positions, list) else []):
+            qty = abs(dec(p.get("positionAmt")))
+            if qty <= 0:
+                continue
+            found += 1
+            symbol = str(p.get("symbol", "")).upper()
+            side = str(p.get("positionSide", "")).upper()
+            owner = owners.get(symbol) or "DESCONHECIDO/EXTERNO"
+            entry = dec(p.get("entryPrice"))
+            mark = dec(p.get("markPrice"))
+            notional = abs(dec(p.get("notional") or qty * mark))
+            unreal = dec(p.get("unRealizedProfit") or p.get("unrealizedProfit"))
+            margin = dec(p.get("isolatedWallet") or p.get("isolatedMargin"))
+            leverage = p.get("leverage") or "?"
+            liq = p.get("liquidationPrice") or "?"
+            move = pct_change(entry, mark) if entry > 0 and mark > 0 else D(0)
+            favorable = move if side == "LONG" else -move
+            target = stop = recovery_level = "-"
+
+            if str(owner).startswith("RANGE:"):
+                basket = (state_range.get(symbol) or {}).get("basket") or {}
+                target = basket.get("recovery_tp_price") or basket.get("tp_price") or "-"
+                stop = basket.get("hard_stop_price") or "-"
+                recovery_level = basket.get("alternations", 0)
+            elif str(owner).startswith("MACD:"):
+                pieces = str(owner).split(":")
+                tf = pieces[2] if len(pieces) >= 3 else ""
+                logical = state_macd.get(f"{symbol}:{tf}") or {}
+                pos = logical.get("position") or {}
+                target = pos.get("tp_price") or "-"
+                stop = pos.get("stop_price") or "-"
+                recovery_level = pos.get("recovery_level", logical.get("loss_streak", 0))
+
+            logger.warning(
+                "OPEN POSITION | strategy=%s | symbol=%s side=%s qty=%s | entry=%s mark=%s move_favoravel=%s%% | "
+                "notional_usd=%s margin_isolada=%s leverage=%sx unreal_pnl=%s | tp=%s stop=%s liq=%s recovery_level=%s",
+                owner, symbol, side, qty, entry, mark, dstr(favorable * D(100), 6),
+                notional, margin, leverage, unreal, target, stop, liq, recovery_level,
+            )
+        if found == 0:
+            logger.info("OPEN POSITION | nenhuma posicao real aberta")
 
     def run(self) -> None:
         self.startup()
