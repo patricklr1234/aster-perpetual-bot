@@ -101,9 +101,9 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.0.0-v3"
+VERSION = "2.0.1-v3"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
-BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi3.asterdex.com").rstrip("/")
+BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
 SIGNER_ADDRESS = os.getenv("ASTER_API_WALLET_ADDRESS", "").strip()
@@ -899,6 +899,17 @@ class AccountManager:
         self._lock = threading.RLock()
 
     def sync(self, force: bool = False) -> None:
+        if not LIVE_TRADING and not VALIDATE_API_ONLY:
+            strategy_count = (
+                (len(SYMBOLS) if RANGE_ENGINE_ENABLED else 0)
+                + (len(SYMBOLS) * len(MACD_TIMEFRAMES) if MACD_ENGINE_ENABLED else 0)
+            )
+            simulated_total = INITIAL_BANKROLL_USD * D(max(1, strategy_count))
+            self.wallet_balance = simulated_total
+            self.available_balance = simulated_total
+            self.unrealized = D(0)
+            self.last_sync = time.time()
+            return
         if not force and time.time() - self.last_sync < ACCOUNT_SYNC_SECONDS:
             return
         with self._lock:
@@ -932,6 +943,8 @@ class AccountManager:
         logger.info("MODES | Hedge Mode confirmado | ISOLATED solicitado em %s", ",".join(SYMBOLS))
 
     def get_brackets(self, symbol: str) -> List[Dict[str, Any]]:
+        if not LIVE_TRADING:
+            return []
         try:
             x = self.client.leverage_bracket(symbol)
             if isinstance(x, list):
