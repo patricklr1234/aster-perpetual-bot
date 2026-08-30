@@ -4,11 +4,12 @@
 ASTER PERPETUAL BOT V1 - BTC / ETH / HYPE
 =========================================
 
-Motores:
-  A) RANGE_1PCT: gatilho +/-1% do ponto zero, alvo +1%, hedge/recovery alternado,
-     martingale financeiro 3x, protecao apos 3 falhas e rearmamento apos 3%.
+Motores independentes:
+  A) RANGE_1PCT: gatilho EXCLUSIVAMENTE por +/-1% do ponto zero, sem MACD,
+     alvo +1%, hedge/recovery alternado,
+     recovery 4x minimo com dimensionamento dinamico liquido, protecao apos 3 falhas.
   B) MACD: BTC/ETH/HYPE em 5m e 15m, MACD 7/21/9, entrada apenas no cruzamento
-     confirmado em candle fechado, recovery 3x da perda acumulada e protecao
+     confirmado em candle fechado, TP 1%, stop 2%, recovery 4x e protecao
      apos 3 perdas consecutivas com deslocamento minimo de 3% + novo cruzamento.
 
 Conta/margem:
@@ -50,8 +51,10 @@ Variaveis principais Railway:
   BTC_INITIAL_BANKROLL_USD=20
   BTC_INITIAL_OPERATION_NOTIONAL_USD=100
   MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT=0.05
-  RECOVERY_MULTIPLIER=3
+  RECOVERY_MULTIPLIER=4
   MAX_RECOVERY_FAILURES=3
+  MACD_TAKE_PROFIT_PCT=0.01
+  MACD_HARD_STOP_PCT=0.02
   NEWS_FILTER_ENABLED=1
   NEWS_FAIL_CLOSED=1
 
@@ -102,7 +105,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.2.0-v3"
+VERSION = "2.3.1-v3"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -130,7 +133,7 @@ INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv(
 ))
 BTC_INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv("BTC_INITIAL_OPERATION_NOTIONAL_USD", "100"))
 MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT = D(os.getenv("MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT", "0.05"))
-RECOVERY_MULTIPLIER = D(os.getenv("RECOVERY_MULTIPLIER", "3"))
+RECOVERY_MULTIPLIER = D(os.getenv("RECOVERY_MULTIPLIER", "4"))
 MAX_RECOVERY_FAILURES = int(os.getenv("MAX_RECOVERY_FAILURES", "3"))
 
 MAX_REQUESTED_LEVERAGE = int(os.getenv("MAX_REQUESTED_LEVERAGE", "35"))
@@ -144,6 +147,7 @@ MIN_FREE_WALLET_BUFFER_USD = D(os.getenv("MIN_FREE_WALLET_BUFFER_USD", "1.00"))
 MAX_MARGIN_FRACTION_PER_STRATEGY = D(os.getenv("MAX_MARGIN_FRACTION_PER_STRATEGY", "1.0"))
 
 # Range engine
+RANGE_SIGNAL_MODE = "VOLATILITY_ONLY"  # invariavel: este motor nunca consulta MACD
 RANGE_TRIGGER_PCT = D(os.getenv("RANGE_TRIGGER_PCT", "0.01"))
 RANGE_TAKE_PROFIT_PCT = D(os.getenv("RANGE_TAKE_PROFIT_PCT", "0.01"))
 RANGE_HARD_STOP_PCT = D(os.getenv("RANGE_HARD_STOP_PCT", "0.02"))
@@ -157,6 +161,8 @@ MACD_SLOW = int(os.getenv("MACD_SLOW", "21"))
 MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
 MACD_TIMEFRAMES = tuple(x.strip() for x in os.getenv("MACD_TIMEFRAMES", "5m,15m").split(",") if x.strip())
 MACD_REARM_PCT = D(os.getenv("MACD_REARM_PCT", "0.03"))
+MACD_TAKE_PROFIT_PCT = D(os.getenv("MACD_TAKE_PROFIT_PCT", "0.01"))
+MACD_HARD_STOP_PCT = D(os.getenv("MACD_HARD_STOP_PCT", "0.02"))
 
 # Trade execution
 RECV_WINDOW = int(os.getenv("RECV_WINDOW", "5000"))
@@ -1082,7 +1088,8 @@ class AccountManager:
 
     def sizing_for_profit_target(self, symbol: str, price: Decimal, strategy_state: Dict[str, Any],
                                  target_profit: Optional[Decimal], target_move_pct: Decimal,
-                                 adverse_distance_pct: Decimal, recovery_level: int = 0) -> Optional[Dict[str, Any]]:
+                                 adverse_distance_pct: Decimal, recovery_level: int = 0,
+                                 desired_notional_override: Optional[Decimal] = None) -> Optional[Dict[str, Any]]:
         self.sync()
         # Apply a configured bankroll increase only after the old position/basket is flat.
         # Existing trades keep their original accounting until their normal close.
@@ -1119,10 +1126,12 @@ class AccountManager:
             if margin > base_budget:
                 return None
         else:
-            # Classic 3x martingale on TOTAL NOTIONAL: base, 3x, 9x, 27x.
+            # Classic 4x martingale on TOTAL NOTIONAL: base, 4x, 16x, 64x.
             # target_profit remains accounting metadata; it no longer inflates sizing
             # by dividing the deficit by a hypothetical 1% price movement.
-            desired_notional = base_notional * (RECOVERY_MULTIPLIER ** recovery_level)
+            classic_notional = base_notional * (RECOVERY_MULTIPLIER ** recovery_level)
+            desired_notional = max(classic_notional, dec(desired_notional_override)) \
+                if desired_notional_override is not None else classic_notional
             cap, meta = self.safe_leverage_cap(symbol, desired_notional, adverse_distance_pct)
             # Use the highest safe leverage. Isolated collateral may temporarily exceed
             # logical equity because collateral is returned on close; risk to the stop
@@ -1170,6 +1179,7 @@ class AccountManager:
             "estimated_adverse_loss": estimated_adverse_loss,
             "target_profit": target_profit or D(0),
             "recovery_level": recovery_level,
+            "desired_notional_override": desired_notional_override,
             "meta": meta,
         }
 
@@ -1363,8 +1373,48 @@ class RangeEngine:
             total += (price - ep) * q if leg["side"] == "LONG" else (ep - price) * q
         return total
 
+    @staticmethod
+    def estimated_net_pnl(legs: List[Dict[str, Any]], exit_price: Decimal) -> Decimal:
+        """PNL liquido estimado de todas as pernas no preco de fechamento."""
+        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        total = D(0)
+        for leg in legs:
+            qty = dec(leg["qty"])
+            entry = dec(leg["entry_price"])
+            gross = (exit_price - entry) * qty if leg["side"] == "LONG" else (entry - exit_price) * qty
+            fees = (entry * qty + exit_price * qty) * fee_rate
+            total += gross - fees
+        return total
+
+    def dynamic_recovery_notional(self, st: Dict[str, Any], basket: Dict[str, Any],
+                                  new_side: str, entry_price: Decimal,
+                                  recovery_level: int) -> Tuple[Decimal, Decimal, Decimal]:
+        """
+        Calcula a nova perna para que, no TP de 1%, o PNL liquido do basket
+        inteiro cubra o deficit anterior e ainda gere 1% sobre o notional-base.
+
+        Como as pernas antigas permanecem abertas, 3x nao basta: uma perna 3x
+        contra uma perna 1x deixa apenas 2x liquidos. O piso classico e 4x;
+        taxas e lotes podem exigir um pouco mais, calculado dinamicamente.
+        """
+        tp_price = entry_price * (D(1) + RANGE_TAKE_PROFIT_PCT) \
+            if new_side == "LONG" else entry_price * (D(1) - RANGE_TAKE_PROFIT_PCT)
+        existing_at_tp = self.estimated_net_pnl(basket.get("legs", []), tp_price)
+        base_notional = max(configured_initial_notional(self.symbol), dec(st.get("equity")))
+        desired_basket_profit = dec(st.get("recovery_deficit")) + base_notional * RANGE_TAKE_PROFIT_PCT
+        fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
+        move_yield = abs(tp_price - entry_price) / entry_price
+        round_trip_fee_yield = fee_rate * (D(1) + tp_price / entry_price)
+        net_yield = move_yield - round_trip_fee_yield
+        if net_yield <= 0:
+            raise RuntimeError("RANGE recovery sem rendimento liquido positivo no TP")
+        dynamic_notional = max(D(0), (desired_basket_profit - existing_at_tp) / net_yield)
+        classic_floor = base_notional * (RECOVERY_MULTIPLIER ** recovery_level)
+        return max(dynamic_notional, classic_floor), tp_price, existing_at_tp
+
     def _open(self, side: str, price: Decimal, target_profit: Optional[Decimal], reason: str,
-              recovery_level: int = 0) -> Optional[Dict[str, Any]]:
+              recovery_level: int = 0,
+              desired_notional_override: Optional[Decimal] = None) -> Optional[Dict[str, Any]]:
         st = self.st()
         blocked, why = self.news.blocked()
         if blocked:
@@ -1378,6 +1428,7 @@ class RangeEngine:
         sizing = self.account.sizing_for_profit_target(
             self.symbol, price, st, target_profit, RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
             recovery_level=recovery_level,
+            desired_notional_override=desired_notional_override,
         )
         if not sizing:
             release_owner(self.store, self.symbol, self.id)
@@ -1456,6 +1507,9 @@ class RangeEngine:
         st = self.st(); b = st.get("basket")
         if not b:
             return
+        if int(b.get("alternations", 0)) >= MAX_RECOVERY_FAILURES:
+            self._close_basket(price, "MAX_RECOVERY_FAILURES_AFTER_FULL_ATTEMPTS", protect_after=True)
+            return
         current = b["active_side"]
         new_side = "SHORT" if current == "LONG" else "LONG"
         # Loss to be recovered = official recovery deficit + current basket negative MTM.
@@ -1465,8 +1519,12 @@ class RangeEngine:
         if target <= 0:
             target = None
         recovery_level = min(int(b.get("alternations", 0)) + 1, MAX_RECOVERY_FAILURES)
+        desired_notional, recovery_tp, existing_at_tp = self.dynamic_recovery_notional(
+            st, b, new_side, price, recovery_level
+        )
         leg = self._open(new_side, price, target, "RANGE_ALTERNATING_RECOVERY",
-                         recovery_level=recovery_level)
+                         recovery_level=recovery_level,
+                         desired_notional_override=desired_notional)
         if not leg:
             return
         b["legs"].append(leg)
@@ -1479,14 +1537,13 @@ class RangeEngine:
         else:
             b["next_reverse_price"] = b["initial_entry"]
         # Recovery leg seeks 1% in its favor. When hit, close all legs together.
-        b["recovery_tp_price"] = str(price * (D(1) + RANGE_TAKE_PROFIT_PCT) if new_side == "LONG" else price * (D(1) - RANGE_TAKE_PROFIT_PCT))
+        b["recovery_tp_price"] = str(recovery_tp)
         st["last_update"] = now_iso()
         self.store.save()
-        logger.warning("RANGE REVERSE | %s | new=%s @%s | mtm=%s accumulated_loss=%s target3x=%s failures=%s",
-                       self.symbol, new_side, price, mtm, accumulated_loss, target, st["failures"])
-        if b["alternations"] >= MAX_RECOVERY_FAILURES:
-            # User protection: after 3 wrong alternations close all and wait 3%.
-            self._close_basket(price, "MAX_3_RECOVERY_FAILURES", protect_after=True)
+        logger.warning("RANGE REVERSE 4X DINAMICO | %s | new=%s @%s | mtm=%s existing_at_tp=%s "
+                       "desired_notional=%s recovery_tp=%s failures=%s",
+                       self.symbol, new_side, price, mtm, existing_at_tp,
+                       desired_notional, recovery_tp, st["failures"])
 
     def tick(self, price: Decimal) -> None:
         with self.store.lock:
@@ -1615,7 +1672,8 @@ class MacdEngine:
             logger.info("MACD OWNER BLOCK | %s | owner=%s", self.id, self.store.state["symbol_owner"].get(self.symbol)); return
         rd = dec(st.get("recovery_deficit"))
         target = rd * RECOVERY_MULTIPLIER if rd > 0 else None
-        # MACD has no fixed TP; use 1% as sizing recovery objective, while actual exit is opposite cross.
+        # MACD V2.3: TP real de 1% e stop real de 2%; o cruzamento oposto
+        # continua sendo uma saida antecipada adicional.
         recovery_level = min(int(st.get("loss_streak", 0)), MAX_RECOVERY_FAILURES) if rd > 0 else 0
         sizing = self.account.sizing_for_profit_target(
             self.symbol, price, st, target, D("0.01"), D("0.02"), recovery_level=recovery_level
@@ -1626,14 +1684,46 @@ class MacdEngine:
         logger.info("MACD SIZING | %s | side=%s target=%s lev=%sx notional=%s margin=%s qty=%s meta=%s",
                     self.id, side, target, sizing["leverage"], sizing["notional"], sizing["margin"], sizing["qty"], sizing["meta"])
         leg = self.exe.open_leg(self.id, self.symbol, side, sizing, "MACD_CROSS")
-        st["position"] = {"side": side, "leg": leg, "opened_at": now_iso()}
+        entry = dec(leg["entry_price"])
+        tp_price = entry * (D(1) + MACD_TAKE_PROFIT_PCT) if side == "LONG" else entry * (D(1) - MACD_TAKE_PROFIT_PCT)
+        stop_price = entry * (D(1) - MACD_HARD_STOP_PCT) if side == "LONG" else entry * (D(1) + MACD_HARD_STOP_PCT)
+        st["position"] = {
+            "side": side, "leg": leg, "opened_at": now_iso(),
+            "tp_price": str(tp_price), "stop_price": str(stop_price),
+            "recovery_level": recovery_level,
+        }
         st["last_update"] = now_iso()
         self.store.save()
-        logger.info("MACD OPEN | %s | %s @%s | lev=%sx qty=%s notional=%s margin=%s target3x=%s",
-                    self.id, side, price, sizing["leverage"], sizing["qty"], sizing["notional"], sizing["margin"], target)
+        logger.info("MACD OPEN | %s | %s @%s | lev=%sx qty=%s notional=%s margin=%s "
+                    "tp_1pct=%s stop_2pct=%s recovery_level=%s multiplier=%sx",
+                    self.id, side, entry, sizing["leverage"], sizing["qty"], sizing["notional"],
+                    sizing["margin"], tp_price, stop_price, recovery_level, RECOVERY_MULTIPLIER)
 
     def tick(self, price: Decimal) -> None:
         st = self.st()
+        # TP/stop precisam ser verificados em todo ticker, nao apenas quando fecha
+        # um candle. Isto corrige posicoes muito positivas que ficavam abertas
+        # aguardando um cruzamento MACD contrario.
+        pos = st.get("position")
+        if pos:
+            side = pos["side"]
+            entry = dec(pos["leg"]["entry_price"])
+            tp_price = dec(pos.get("tp_price"))
+            stop_price = dec(pos.get("stop_price"))
+            # Migracao transparente para posicoes abertas por versoes anteriores.
+            if tp_price <= 0:
+                tp_price = entry * (D(1) + MACD_TAKE_PROFIT_PCT) if side == "LONG" else entry * (D(1) - MACD_TAKE_PROFIT_PCT)
+                pos["tp_price"] = str(tp_price)
+            if stop_price <= 0:
+                stop_price = entry * (D(1) - MACD_HARD_STOP_PCT) if side == "LONG" else entry * (D(1) + MACD_HARD_STOP_PCT)
+                pos["stop_price"] = str(stop_price)
+            if (side == "LONG" and price >= tp_price) or (side == "SHORT" and price <= tp_price):
+                self._close(price, "MACD_TAKE_PROFIT_1PCT")
+                return
+            if (side == "LONG" and price <= stop_price) or (side == "SHORT" and price >= stop_price):
+                self._close(price, "MACD_HARD_STOP_2PCT")
+                return
+
         try:
             closes, close_ms = self.closed_closes()
         except Exception as e:
@@ -1749,13 +1839,18 @@ class Bot:
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info("%s | version=%s | LIVE_TRADING=%s", BOT_NAME, VERSION, LIVE_TRADING)
-        logger.info("SYMBOLS=%s | RANGE=%s | MACD=%s | TF=%s", SYMBOLS, RANGE_ENGINE_ENABLED, MACD_ENGINE_ENABLED, MACD_TIMEFRAMES)
+        logger.info("SYMBOLS=%s | RANGE=%s mode=%s (SEM MACD) | MACD=%s TF=%s",
+                    SYMBOLS, RANGE_ENGINE_ENABLED, RANGE_SIGNAL_MODE,
+                    MACD_ENGINE_ENABLED, MACD_TIMEFRAMES)
         logger.info("MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV=%s | BOT_HARD_CAP=%s | API_HARD_CAP=%s",
                     MAX_REQUESTED_LEVERAGE, BOT_HARD_MAX_LEVERAGE, API_HARD_MAX_LEVERAGE)
         logger.info("BASE ETH/HYPE: bankroll=%s notional=%s | BASE BTC: bankroll=%s notional=%s | RECOVERY=%sx | MAX_FAIL=%s",
                     INITIAL_BANKROLL_USD, INITIAL_OPERATION_NOTIONAL_USD,
                     BTC_INITIAL_BANKROLL_USD, BTC_INITIAL_OPERATION_NOTIONAL_USD,
                     RECOVERY_MULTIPLIER, MAX_RECOVERY_FAILURES)
+        logger.info("EXITS | RANGE_TP=%s RANGE_STOP=%s | MACD_TP=%s MACD_STOP=%s | RANGE_RECOVERY=4X_MIN+DYNAMIC_NET",
+                    RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
+                    MACD_TAKE_PROFIT_PCT, MACD_HARD_STOP_PCT)
         logger.info("NEWS 3-STAR=%s | janela=-%sm/+%sm | fail_closed=%s", NEWS_FILTER_ENABLED, NEWS_WINDOW_BEFORE_MIN, NEWS_WINDOW_AFTER_MIN, NEWS_FAIL_CLOSED)
         logger.info("SAME_SYMBOL_MULTI_STRATEGY=%s (0 preserva contabilidade exata da posicao agregada Aster)", ALLOW_MULTI_STRATEGY_SAME_SYMBOL)
         logger.info("=" * 90)
