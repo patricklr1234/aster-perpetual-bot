@@ -16,16 +16,15 @@ Conta/margem:
   - Hedge Mode obrigatorio.
   - ISOLATED obrigatorio.
   - Alavancagem adaptativa por ordem, consultando leverageBracket.
-  - A API documentada aceita leverage 1..125. MAX_REQUESTED_LEVERAGE pode ser 150,
-    mas o bot limita automaticamente ao menor valor entre 125 e o permitido pelo ativo.
+  - A API documentada aceita leverage 1..125, mas este bot usa limite absoluto de 35x.
   - O bot tambem limita leverage para manter distancia de liquidacao estimada acima do
     stop/protecao configurado. Com stop de 2%, 125x normalmente NAO sera seguro.
 
 IMPORTANTE SOBRE "USD 10 por operacao":
-  O codigo interpreta INITIAL_OPERATION_MARGIN_USD=10 como ORCAMENTO DE MARGEM da
-  primeira entrada, e nao como notional. A exposicao (notional) = margem * leverage.
-  Se voce quiser US$10 de NOTIONAL em vez de US$10 de margem, use
-  OPERATION_VALUE_MODE=NOTIONAL.
+  INITIAL_OPERATION_NOTIONAL_USD=10 significa US$10 de EXPOSICAO TOTAL (notional),
+  independentemente da alavancagem. A margem isolada usada sera notional/leverage.
+  Se o lote minimo da Aster obrigar uma posicao acima do limite configurado, a entrada
+  sera bloqueada em vez de ser arredondada silenciosamente para cima.
 
 Seguranca:
   - LIVE_TRADING=0 por padrao.
@@ -45,10 +44,12 @@ Variaveis principais Railway:
   LIVE_TRADING=0
   VALIDATE_API_ONLY=1
   BOT_DIR=/data
-  MAX_REQUESTED_LEVERAGE=150
+  MAX_REQUESTED_LEVERAGE=35
   INITIAL_BANKROLL_USD=10
-  INITIAL_OPERATION_MARGIN_USD=10
-  OPERATION_VALUE_MODE=MARGIN
+  INITIAL_OPERATION_NOTIONAL_USD=10
+  BTC_INITIAL_BANKROLL_USD=20
+  BTC_INITIAL_OPERATION_NOTIONAL_USD=100
+  MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT=0.05
   RECOVERY_MULTIPLIER=3
   MAX_RECOVERY_FAILURES=3
   NEWS_FILTER_ENABLED=1
@@ -101,7 +102,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.0.3-v3"
+VERSION = "2.2.0-v3"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -120,16 +121,25 @@ LOG_FILE = BOT_DIR / "aster_bot.log"
 SYMBOLS = tuple(s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,HYPEUSDT").split(",") if s.strip())
 
 INITIAL_BANKROLL_USD = D(os.getenv("INITIAL_BANKROLL_USD", "10"))
-INITIAL_OPERATION_MARGIN_USD = D(os.getenv("INITIAL_OPERATION_MARGIN_USD", "10"))
-OPERATION_VALUE_MODE = os.getenv("OPERATION_VALUE_MODE", "MARGIN").upper().strip()  # MARGIN|NOTIONAL
+BTC_INITIAL_BANKROLL_USD = D(os.getenv("BTC_INITIAL_BANKROLL_USD", "20"))
+# Canonical sizing is NOTIONAL: leverage changes required margin, never entry exposure.
+# The legacy variable is accepted only as a migration fallback for existing Railway setups.
+INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv(
+    "INITIAL_OPERATION_NOTIONAL_USD",
+    os.getenv("INITIAL_OPERATION_MARGIN_USD", "10"),
+))
+BTC_INITIAL_OPERATION_NOTIONAL_USD = D(os.getenv("BTC_INITIAL_OPERATION_NOTIONAL_USD", "100"))
+MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT = D(os.getenv("MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT", "0.05"))
 RECOVERY_MULTIPLIER = D(os.getenv("RECOVERY_MULTIPLIER", "3"))
 MAX_RECOVERY_FAILURES = int(os.getenv("MAX_RECOVERY_FAILURES", "3"))
 
-MAX_REQUESTED_LEVERAGE = int(os.getenv("MAX_REQUESTED_LEVERAGE", "150"))
+MAX_REQUESTED_LEVERAGE = int(os.getenv("MAX_REQUESTED_LEVERAGE", "35"))
 API_HARD_MAX_LEVERAGE = 125
+BOT_HARD_MAX_LEVERAGE = 35
 MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", "1"))
 LEVERAGE_HEADROOM = D(os.getenv("LEVERAGE_HEADROOM", "0.95"))
 LIQUIDATION_BUFFER_PCT = D(os.getenv("LIQUIDATION_BUFFER_PCT", "0.005"))  # 0.5%
+ADVERSE_MOVE_SAFETY_MULTIPLIER = D(os.getenv("ADVERSE_MOVE_SAFETY_MULTIPLIER", "1.25"))
 MIN_FREE_WALLET_BUFFER_USD = D(os.getenv("MIN_FREE_WALLET_BUFFER_USD", "1.00"))
 MAX_MARGIN_FRACTION_PER_STRATEGY = D(os.getenv("MAX_MARGIN_FRACTION_PER_STRATEGY", "1.0"))
 
@@ -844,11 +854,20 @@ class NewsFilter:
 # STATE
 # -----------------------------------------------------------------------------
 
+def configured_bankroll(symbol: str) -> Decimal:
+    return BTC_INITIAL_BANKROLL_USD if symbol.upper() == "BTCUSDT" else INITIAL_BANKROLL_USD
+
+
+def configured_initial_notional(symbol: str) -> Decimal:
+    return BTC_INITIAL_OPERATION_NOTIONAL_USD if symbol.upper() == "BTCUSDT" else INITIAL_OPERATION_NOTIONAL_USD
+
 def empty_range_state(symbol: str) -> Dict[str, Any]:
+    bankroll = configured_bankroll(symbol)
     return {
         "strategy": f"RANGE:{symbol}",
         "symbol": symbol,
-        "equity": str(INITIAL_BANKROLL_USD),
+        "equity": str(bankroll),
+        "bankroll_config_base": str(bankroll),
         "anchor": None,
         "status": "IDLE",  # IDLE|BASKET|PROTECT
         "basket": None,
@@ -864,11 +883,13 @@ def empty_range_state(symbol: str) -> Dict[str, Any]:
 
 
 def empty_macd_state(symbol: str, tf: str) -> Dict[str, Any]:
+    bankroll = configured_bankroll(symbol)
     return {
         "strategy": f"MACD:{symbol}:{tf}",
         "symbol": symbol,
         "tf": tf,
-        "equity": str(INITIAL_BANKROLL_USD),
+        "equity": str(bankroll),
+        "bankroll_config_base": str(bankroll),
         "position": None,
         "recovery_deficit": "0",
         "loss_streak": 0,
@@ -959,7 +980,13 @@ class AccountManager:
                 (len(SYMBOLS) if RANGE_ENGINE_ENABLED else 0)
                 + (len(SYMBOLS) * len(MACD_TIMEFRAMES) if MACD_ENGINE_ENABLED else 0)
             )
-            simulated_total = INITIAL_BANKROLL_USD * D(max(1, strategy_count))
+            simulated_total = D(0)
+            if RANGE_ENGINE_ENABLED:
+                simulated_total += sum((configured_bankroll(s) for s in SYMBOLS), D(0))
+            if MACD_ENGINE_ENABLED:
+                simulated_total += sum((configured_bankroll(s) * D(len(MACD_TIMEFRAMES)) for s in SYMBOLS), D(0))
+            if strategy_count == 0:
+                simulated_total = INITIAL_BANKROLL_USD
             self.wallet_balance = simulated_total
             self.available_balance = simulated_total
             self.unrealized = D(0)
@@ -1030,28 +1057,47 @@ class AccountManager:
                 chosen = brackets[-1]
             max_lev = int(chosen.get("initialLeverage", max_lev))
             mmr = dec(chosen.get("maintMarginRatio"), "0.005")
-        return max(1, min(max_lev, API_HARD_MAX_LEVERAGE, MAX_REQUESTED_LEVERAGE)), mmr
+        return max(1, min(max_lev, API_HARD_MAX_LEVERAGE, BOT_HARD_MAX_LEVERAGE,
+                          MAX_REQUESTED_LEVERAGE)), mmr
 
     def safe_leverage_cap(self, symbol: str, notional: Decimal, adverse_distance_pct: Decimal) -> Tuple[int, Dict[str, Any]]:
         exch_max, mmr = self.max_exchange_leverage(symbol, notional)
         # Approx isolated liquidation-distance safety model:
         # initial margin rate ~= 1/L. Require 1/L > adverse_move + mmr + buffer.
-        denom = adverse_distance_pct + mmr + LIQUIDATION_BUFFER_PCT
+        protected_move = adverse_distance_pct * ADVERSE_MOVE_SAFETY_MULTIPLIER
+        denom = protected_move + mmr + LIQUIDATION_BUFFER_PCT
         liq_safe = int((D(1) / denom).to_integral_value(rounding=ROUND_DOWN)) if denom > 0 else exch_max
-        cap = max(MIN_LEVERAGE, min(exch_max, liq_safe, API_HARD_MAX_LEVERAGE, MAX_REQUESTED_LEVERAGE))
-        return cap, {"exchange_max": exch_max, "mmr": str(mmr), "liq_safe_max": liq_safe, "denom": str(denom)}
+        cap = max(MIN_LEVERAGE, min(exch_max, liq_safe, API_HARD_MAX_LEVERAGE,
+                                    BOT_HARD_MAX_LEVERAGE, MAX_REQUESTED_LEVERAGE))
+        return cap, {"exchange_max": exch_max, "bot_hard_max": BOT_HARD_MAX_LEVERAGE,
+                     "mmr": str(mmr), "protected_move": str(protected_move),
+                     "liq_safe_max": liq_safe, "denom": str(denom)}
 
     def base_margin_budget(self, strategy_state: Dict[str, Any]) -> Decimal:
         eq = dec(strategy_state.get("equity"), str(INITIAL_BANKROLL_USD))
-        # User rule: if equity > 10, use 100% of current logical cash as initial budget.
-        desired = max(INITIAL_OPERATION_MARGIN_USD, eq)
+        # Recovery margin may use the individual logical cash, within the configured cap.
+        desired = eq
         desired = min(desired, eq * MAX_MARGIN_FRACTION_PER_STRATEGY)
         return max(D(0), desired)
 
     def sizing_for_profit_target(self, symbol: str, price: Decimal, strategy_state: Dict[str, Any],
                                  target_profit: Optional[Decimal], target_move_pct: Decimal,
-                                 adverse_distance_pct: Decimal) -> Optional[Dict[str, Any]]:
+                                 adverse_distance_pct: Decimal, recovery_level: int = 0) -> Optional[Dict[str, Any]]:
         self.sync()
+        # Apply a configured bankroll increase only after the old position/basket is flat.
+        # Existing trades keep their original accounting until their normal close.
+        active = bool(strategy_state.get("position") or strategy_state.get("basket"))
+        configured_base = configured_bankroll(symbol)
+        previous_base = dec(strategy_state.get("bankroll_config_base"), str(INITIAL_BANKROLL_USD))
+        if not active and configured_base != previous_base:
+            previous_equity = dec(strategy_state.get("equity"), str(previous_base))
+            strategy_state["equity"] = str(previous_equity + configured_base - previous_base)
+            strategy_state["bankroll_config_base"] = str(configured_base)
+            strategy_state["last_update"] = now_iso()
+            self.store.save()
+            logger.info("BANKROLL MIGRATION | %s | base %s->%s | equity %s->%s",
+                        strategy_state.get("strategy", symbol), previous_base, configured_base,
+                        previous_equity, strategy_state["equity"])
         logical_eq = dec(strategy_state.get("equity"), str(INITIAL_BANKROLL_USD))
         physical_free = self.free_margin()
         if logical_eq <= 0 or physical_free <= 0:
@@ -1061,48 +1107,59 @@ class AccountManager:
         if base_budget <= 0:
             return None
 
-        if target_profit is None or target_profit <= 0:
-            # Fresh operation: use the configured base value and highest safe leverage.
-            if OPERATION_VALUE_MODE == "NOTIONAL":
-                desired_notional = max(INITIAL_OPERATION_MARGIN_USD, logical_eq)
-                cap, meta = self.safe_leverage_cap(symbol, desired_notional, adverse_distance_pct)
-                margin = desired_notional / D(cap)
-                if margin > base_budget:
-                    return None
-                lev = cap
-            else:
-                # Need an estimate, iterate because bracket max can depend on notional.
-                lev = min(MAX_REQUESTED_LEVERAGE, API_HARD_MAX_LEVERAGE)
-                desired_notional = base_budget * D(lev)
-                cap, meta = self.safe_leverage_cap(symbol, desired_notional, adverse_distance_pct)
-                lev = cap
-                desired_notional = base_budget * D(lev)
-                margin = base_budget
-        else:
-            # Need target_profit net-ish over target movement. Add taker entry+exit fee reserve.
-            # Official base taker can differ by tier; default 0.035% each side configurable.
-            taker = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
-            effective_move = target_move_pct - (taker * D(2))
-            if effective_move <= 0:
-                return None
-            desired_notional = target_profit / effective_move
+        recovery_level = max(0, min(int(recovery_level), MAX_RECOVERY_FAILURES))
+        base_notional = max(configured_initial_notional(symbol), logical_eq)
+        if recovery_level == 0:
+            # Fresh operation: exposure is the configured notional, growing only with
+            # the individual strategy equity. Leverage changes margin, not exposure.
+            desired_notional = base_notional
             cap, meta = self.safe_leverage_cap(symbol, desired_notional, adverse_distance_pct)
-            # Minimum leverage required to fit within available margin budget.
-            req = int((desired_notional / base_budget).to_integral_value(rounding=ROUND_UP))
-            if req > cap:
-                logger.warning("SIZING NAO CABE | %s | target_profit=%s desired_notional=%s margin_budget=%s lev_req=%s lev_cap=%s meta=%s",
-                               symbol, target_profit, desired_notional, base_budget, req, cap, meta)
-                return None
-            lev = max(MIN_LEVERAGE, req)
+            lev = cap
             margin = desired_notional / D(lev)
-            # Use only necessary margin, not all cash, during recovery.
+            if margin > base_budget:
+                return None
+        else:
+            # Classic 3x martingale on TOTAL NOTIONAL: base, 3x, 9x, 27x.
+            # target_profit remains accounting metadata; it no longer inflates sizing
+            # by dividing the deficit by a hypothetical 1% price movement.
+            desired_notional = base_notional * (RECOVERY_MULTIPLIER ** recovery_level)
+            cap, meta = self.safe_leverage_cap(symbol, desired_notional, adverse_distance_pct)
+            # Use the highest safe leverage. Isolated collateral may temporarily exceed
+            # logical equity because collateral is returned on close; risk to the stop
+            # remains limited separately below.
+            lev = cap
+            margin = desired_notional / D(lev)
 
-        lev = max(MIN_LEVERAGE, min(int(lev), MAX_REQUESTED_LEVERAGE, API_HARD_MAX_LEVERAGE))
-        notional = desired_notional if target_profit else (margin * D(lev))
+        lev = max(MIN_LEVERAGE, min(int(lev), MAX_REQUESTED_LEVERAGE,
+                                    BOT_HARD_MAX_LEVERAGE, API_HARD_MAX_LEVERAGE))
+        fresh_operation = recovery_level == 0
+        notional = desired_notional
         qty = self.rules.qty(symbol, notional / price, price)
         actual_notional = qty * price
         actual_margin = actual_notional / D(lev)
-        if actual_margin > physical_free or actual_margin > logical_eq:
+        estimated_adverse_loss = actual_notional * adverse_distance_pct
+        if fresh_operation:
+            max_allowed = desired_notional * (D(1) + MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT)
+            if actual_notional > max_allowed:
+                rule = self.rules.rules[symbol]
+                logger.warning(
+                    "SIZING BLOCK | %s | entrada_inicial=%s notional_minimo_real=%s "
+                    "limite_com_tolerancia=%s min_qty=%s step=%s price=%s",
+                    symbol, desired_notional, actual_notional, max_allowed,
+                    rule.min_qty, rule.step_size, price,
+                )
+                return None
+        if estimated_adverse_loss > logical_eq * MAX_MARGIN_FRACTION_PER_STRATEGY:
+            logger.warning(
+                "SIZING RISK BLOCK | %s | notional=%s perda_estimada_stop=%s caixa_logico=%s level=%s",
+                symbol, actual_notional, estimated_adverse_loss, logical_eq, recovery_level,
+            )
+            return None
+        if actual_margin > physical_free:
+            logger.warning(
+                "SIZING MARGIN BLOCK | %s | margin_necessaria=%s margem_livre=%s notional=%s lev=%sx level=%s",
+                symbol, actual_margin, physical_free, actual_notional, lev, recovery_level,
+            )
             return None
         return {
             "leverage": lev,
@@ -1110,7 +1167,9 @@ class AccountManager:
             "price": price,
             "notional": actual_notional,
             "margin": actual_margin,
+            "estimated_adverse_loss": estimated_adverse_loss,
             "target_profit": target_profit or D(0),
+            "recovery_level": recovery_level,
             "meta": meta,
         }
 
@@ -1304,7 +1363,8 @@ class RangeEngine:
             total += (price - ep) * q if leg["side"] == "LONG" else (ep - price) * q
         return total
 
-    def _open(self, side: str, price: Decimal, target_profit: Optional[Decimal], reason: str) -> Optional[Dict[str, Any]]:
+    def _open(self, side: str, price: Decimal, target_profit: Optional[Decimal], reason: str,
+              recovery_level: int = 0) -> Optional[Dict[str, Any]]:
         st = self.st()
         blocked, why = self.news.blocked()
         if blocked:
@@ -1316,9 +1376,11 @@ class RangeEngine:
             logger.info("RANGE BLOQUEADO OWNER | %s | owner=%s", self.symbol, self.store.state["symbol_owner"].get(self.symbol))
             return None
         sizing = self.account.sizing_for_profit_target(
-            self.symbol, price, st, target_profit, RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT
+            self.symbol, price, st, target_profit, RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
+            recovery_level=recovery_level,
         )
         if not sizing:
+            release_owner(self.store, self.symbol, self.id)
             logger.warning("RANGE SIZING NAO CABE | %s | target=%s", self.symbol, target_profit)
             return None
         logger.info("RANGE SIZING | %s | side=%s target=%s lev=%sx notional=%s margin=%s qty=%s meta=%s",
@@ -1329,7 +1391,8 @@ class RangeEngine:
         st = self.st()
         rd = dec(st.get("recovery_deficit"))
         target = rd * RECOVERY_MULTIPLIER if rd > 0 else None
-        leg = self._open(side, price, target, "RANGE_INITIAL" if rd == 0 else "RANGE_REARM_RECOVERY")
+        leg = self._open(side, price, target, "RANGE_INITIAL" if rd == 0 else "RANGE_REARM_RECOVERY",
+                         recovery_level=1 if rd > 0 else 0)
         if not leg:
             return
         anchor = dec(st["anchor"])
@@ -1401,7 +1464,9 @@ class RangeEngine:
         target = accumulated_loss * RECOVERY_MULTIPLIER
         if target <= 0:
             target = None
-        leg = self._open(new_side, price, target, "RANGE_ALTERNATING_RECOVERY")
+        recovery_level = min(int(b.get("alternations", 0)) + 1, MAX_RECOVERY_FAILURES)
+        leg = self._open(new_side, price, target, "RANGE_ALTERNATING_RECOVERY",
+                         recovery_level=recovery_level)
         if not leg:
             return
         b["legs"].append(leg)
@@ -1551,15 +1616,21 @@ class MacdEngine:
         rd = dec(st.get("recovery_deficit"))
         target = rd * RECOVERY_MULTIPLIER if rd > 0 else None
         # MACD has no fixed TP; use 1% as sizing recovery objective, while actual exit is opposite cross.
-        sizing = self.account.sizing_for_profit_target(self.symbol, price, st, target, D("0.01"), D("0.02"))
+        recovery_level = min(int(st.get("loss_streak", 0)), MAX_RECOVERY_FAILURES) if rd > 0 else 0
+        sizing = self.account.sizing_for_profit_target(
+            self.symbol, price, st, target, D("0.01"), D("0.02"), recovery_level=recovery_level
+        )
         if not sizing:
+            release_owner(self.store, self.symbol, self.id)
             logger.warning("MACD SIZING NAO CABE | %s | target=%s", self.id, target); return
+        logger.info("MACD SIZING | %s | side=%s target=%s lev=%sx notional=%s margin=%s qty=%s meta=%s",
+                    self.id, side, target, sizing["leverage"], sizing["notional"], sizing["margin"], sizing["qty"], sizing["meta"])
         leg = self.exe.open_leg(self.id, self.symbol, side, sizing, "MACD_CROSS")
         st["position"] = {"side": side, "leg": leg, "opened_at": now_iso()}
         st["last_update"] = now_iso()
         self.store.save()
-        logger.info("MACD OPEN | %s | %s @%s | lev=%sx qty=%s target3x=%s",
-                    self.id, side, price, sizing["leverage"], sizing["qty"], target)
+        logger.info("MACD OPEN | %s | %s @%s | lev=%sx qty=%s notional=%s margin=%s target3x=%s",
+                    self.id, side, price, sizing["leverage"], sizing["qty"], sizing["notional"], sizing["margin"], target)
 
     def tick(self, price: Decimal) -> None:
         st = self.st()
@@ -1679,9 +1750,12 @@ class Bot:
         logger.info("=" * 90)
         logger.info("%s | version=%s | LIVE_TRADING=%s", BOT_NAME, VERSION, LIVE_TRADING)
         logger.info("SYMBOLS=%s | RANGE=%s | MACD=%s | TF=%s", SYMBOLS, RANGE_ENGINE_ENABLED, MACD_ENGINE_ENABLED, MACD_TIMEFRAMES)
-        logger.info("MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV=%s | API_HARD_CAP=%s", MAX_REQUESTED_LEVERAGE, API_HARD_MAX_LEVERAGE)
-        logger.info("BANKROLL_LOGICO=%s por estrategia | INITIAL_OPERATION=%s mode=%s | RECOVERY=%sx | MAX_FAIL=%s",
-                    INITIAL_BANKROLL_USD, INITIAL_OPERATION_MARGIN_USD, OPERATION_VALUE_MODE, RECOVERY_MULTIPLIER, MAX_RECOVERY_FAILURES)
+        logger.info("MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV=%s | BOT_HARD_CAP=%s | API_HARD_CAP=%s",
+                    MAX_REQUESTED_LEVERAGE, BOT_HARD_MAX_LEVERAGE, API_HARD_MAX_LEVERAGE)
+        logger.info("BASE ETH/HYPE: bankroll=%s notional=%s | BASE BTC: bankroll=%s notional=%s | RECOVERY=%sx | MAX_FAIL=%s",
+                    INITIAL_BANKROLL_USD, INITIAL_OPERATION_NOTIONAL_USD,
+                    BTC_INITIAL_BANKROLL_USD, BTC_INITIAL_OPERATION_NOTIONAL_USD,
+                    RECOVERY_MULTIPLIER, MAX_RECOVERY_FAILURES)
         logger.info("NEWS 3-STAR=%s | janela=-%sm/+%sm | fail_closed=%s", NEWS_FILTER_ENABLED, NEWS_WINDOW_BEFORE_MIN, NEWS_WINDOW_AFTER_MIN, NEWS_FAIL_CLOSED)
         logger.info("SAME_SYMBOL_MULTI_STRATEGY=%s (0 preserva contabilidade exata da posicao agregada Aster)", ALLOW_MULTI_STRATEGY_SAME_SYMBOL)
         logger.info("=" * 90)
