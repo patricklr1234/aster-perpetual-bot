@@ -101,7 +101,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.0.1-v3"
+VERSION = "2.0.2-v3"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -392,6 +392,26 @@ class AsterClient:
     def position_mode(self) -> bool:
         x = self._request("GET", "/fapi/v3/positionSide/dual", signed=True)
         return bool(x.get("dualSidePosition"))
+
+    def multi_assets_mode(self) -> bool:
+        x = self._request("GET", "/fapi/v3/multiAssetsMargin", signed=True)
+        return bool(x.get("multiAssetsMargin"))
+
+    def set_single_asset_mode(self) -> None:
+        if not self.multi_assets_mode():
+            return
+        try:
+            self._request("POST", "/fapi/v3/multiAssetsMargin",
+                          {"multiAssetsMargin": "false"}, signed=True)
+        except AsterAPIError as e:
+            raise RuntimeError(
+                "Aster esta em Multi-Assets Mode e nao permitiu mudar automaticamente para "
+                "Single-Asset Mode. Cancele ordens e feche posicoes manuais na conta/subconta, "
+                "desative Multi-Assets Mode na interface Aster e faca novo deploy. "
+                f"Erro original: {e}"
+            ) from e
+        if self.multi_assets_mode():
+            raise RuntimeError("Aster continuou em Multi-Assets Mode apos a solicitacao de desativacao")
 
     def set_hedge_mode(self) -> None:
         try:
@@ -935,6 +955,8 @@ class AccountManager:
         if not LIVE_TRADING:
             logger.info("MODES | simulacao: nao altera Hedge/Isolated")
             return
+        self.client.set_single_asset_mode()
+        logger.info("MODES | Single-Asset Mode confirmado")
         self.client.set_hedge_mode()
         if not self.client.position_mode():
             raise RuntimeError("Conta nao esta em Hedge Mode")
@@ -1634,11 +1656,12 @@ class Bot:
         self.rules.refresh()
         if VALIDATE_API_ONLY:
             mode = self.client.position_mode()
+            multi_assets = self.client.multi_assets_mode()
             balances = self.client.balance()
             account = self.client.account()
             positions = self.client.positions()
-            logger.info("API V3 VALIDADA | signer=%s | hedge=%s | balances=%s | positions=%s | canTrade=%s",
-                        SIGNER_ADDRESS, mode, len(balances) if isinstance(balances, list) else 0,
+            logger.info("API V3 VALIDADA | signer=%s | hedge=%s | multi_assets=%s | balances=%s | positions=%s | canTrade=%s",
+                        SIGNER_ADDRESS, mode, multi_assets, len(balances) if isinstance(balances, list) else 0,
                         len(positions) if isinstance(positions, list) else 0,
                         account.get("canTrade") if isinstance(account, dict) else None)
             return
