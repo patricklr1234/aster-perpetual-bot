@@ -7,10 +7,10 @@ ASTER PERPETUAL BOT V1 - BTC / ETH / HYPE
 Motores independentes:
   A) RANGE_1PCT: gatilho EXCLUSIVAMENTE por +/-1% do ponto zero, sem MACD,
      alvo +1%, hedge/recovery alternado,
-     recovery 4x minimo com dimensionamento dinamico liquido, protecao apos 3 falhas.
+     recovery 4x minimo com dimensionamento dinamico liquido, protecao apos 2 falhas.
   B) MACD: BTC/ETH/HYPE em 5m e 15m, MACD 7/21/9, entrada apenas no cruzamento
      confirmado em candle fechado, TP 1%, stop 2%, recovery 4x e protecao
-     apos 3 perdas consecutivas com deslocamento minimo de 3% + novo cruzamento.
+     apos 2 perdas consecutivas com deslocamento minimo de 3% + novo cruzamento.
 
 Conta/margem:
   - Aster Pro USDT perpetual.
@@ -107,7 +107,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.4.0-v3"
+VERSION = "2.5.0-v3"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -672,6 +672,7 @@ class NewsFilter:
         self.events: List[Dict[str, Any]] = []
         self.last_refresh = 0.0
         self.last_success = 0.0
+        self.last_source = "NONE"
         self.stop = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -683,6 +684,7 @@ class NewsFilter:
             j = json.loads(NEWS_CACHE_FILE.read_text(encoding="utf-8"))
             self.events = j.get("events", [])
             self.last_success = float(j.get("last_success", 0))
+            self.last_source = str(j.get("source", "CACHE"))
         except Exception:
             pass
 
@@ -730,7 +732,12 @@ class NewsFilter:
             manual = [e for e in self.events if e.get("source") == "MANUAL"]
             self.events = events + manual
             self.last_success = time.time()
-            atomic_json_write(NEWS_CACHE_FILE, {"last_success": self.last_success, "events": self.events})
+            self.last_source = source
+            atomic_json_write(NEWS_CACHE_FILE, {
+                "last_success": self.last_success,
+                "source": self.last_source,
+                "events": self.events,
+            })
         logger.info("NEWS | cache atualizado | fonte=%s | eventos_high=%s", source, len(events))
 
     def _fetch_investing(self) -> List[Dict[str, Any]]:
@@ -1994,9 +2001,11 @@ class Bot:
         if time.time() - self.last_hb < HEARTBEAT_SECONDS:
             return
         self.last_hb = time.time()
+        api_ok = True
         try:
             if LIVE_TRADING: self.account.sync(force=True)
         except Exception as e:
+            api_ok = False
             logger.warning("HEARTBEAT account sync | %s", e)
         parts = []
         with self.store.lock:
@@ -2010,6 +2019,29 @@ class Bot:
         logger.info("HEARTBEAT | wallet=%s avail=%s unreal=%s | kill=%s:%s | %s",
                     self.account.wallet_balance, self.account.available_balance, self.account.unrealized,
                     ks.get("mode"), ks.get("reason"), " | ".join(parts))
+        with self.news._lock:
+            news_events = len(self.news.events)
+            news_source = self.news.last_source
+            news_age = int(max(0, time.time() - self.news.last_success)) if self.news.last_success else -1
+        news_health = (
+            "DISABLED" if not NEWS_FILTER_ENABLED else
+            "OK" if self.news.last_success and news_age <= NEWS_MAX_STALE_SECONDS else
+            "STALE"
+        )
+        logger.info(
+            "HEALTH SNAPSHOT | version=%s live=%s api_v3=%s signer=%s | "
+            "mode=HEDGE margin=ISOLATED multi_strategy_same_symbol=%s | "
+            "news=%s source=%s events=%s age_s=%s fail_closed=%s window=-%sm/+%sm | "
+            "range=VOLATILITY_ONLY trigger=%s tp=%s stop=%s | "
+            "macd=%s tf=%s tp=%s stop=%s | recovery=%sx max_fail=%s",
+            VERSION, LIVE_TRADING, "OK" if api_ok else "DEGRADED", SIGNER_ADDRESS,
+            ALLOW_MULTI_STRATEGY_SAME_SYMBOL,
+            news_health, news_source, news_events, news_age, NEWS_FAIL_CLOSED,
+            NEWS_WINDOW_BEFORE_MIN, NEWS_WINDOW_AFTER_MIN,
+            RANGE_TRIGGER_PCT, RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
+            MACD_ENGINE_ENABLED, MACD_TIMEFRAMES, MACD_TAKE_PROFIT_PCT,
+            MACD_HARD_STOP_PCT, RECOVERY_MULTIPLIER, MAX_RECOVERY_FAILURES,
+        )
         if LIVE_TRADING:
             try:
                 self.log_open_positions_detailed()
@@ -2057,11 +2089,35 @@ class Bot:
                 stop = pos.get("stop_price") or "-"
                 recovery_level = pos.get("recovery_level", logical.get("loss_streak", 0))
 
+            def remaining_pct(raw: Any) -> str:
+                try:
+                    level = dec(raw)
+                    if level <= 0 or mark <= 0:
+                        return "-"
+                    return dstr(abs(level - mark) / mark * D(100), 6)
+                except Exception:
+                    return "-"
+
+            tp_distance = remaining_pct(target)
+            stop_distance = remaining_pct(stop)
+            liq_distance = remaining_pct(liq)
+            stop_liq_buffer = "-"
+            try:
+                stop_px, liq_px = dec(stop), dec(liq)
+                if stop_px > 0 and liq_px > 0 and entry > 0:
+                    stop_liq_buffer = dstr(abs(liq_px - stop_px) / entry * D(100), 6)
+            except Exception:
+                pass
+
             logger.warning(
                 "OPEN POSITION | strategy=%s | symbol=%s side=%s qty=%s | entry=%s mark=%s move_favoravel=%s%% | "
-                "notional_usd=%s margin_isolada=%s leverage=%sx unreal_pnl=%s | tp=%s stop=%s liq=%s recovery_level=%s",
+                "notional_usd=%s margin_isolada=%s leverage=%sx unreal_pnl=%s | "
+                "tp=%s distancia_tp=%s%% | stop=%s distancia_stop=%s%% | "
+                "liq=%s distancia_liq=%s%% buffer_stop_liq=%s%% | recovery_level=%s",
                 owner, symbol, side, qty, entry, mark, dstr(favorable * D(100), 6),
-                notional, margin, leverage, unreal, target, stop, liq, recovery_level,
+                notional, margin, leverage, unreal,
+                target, tp_distance, stop, stop_distance,
+                liq, liq_distance, stop_liq_buffer, recovery_level,
             )
         if found == 0:
             logger.info("OPEN POSITION | nenhuma posicao real aberta")
