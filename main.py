@@ -110,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.6.5-v9"
+VERSION = "2.6.6-v10"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -2175,10 +2175,49 @@ class RangeEngine:
                     self._close_basket(price, "INITIAL_HARD_STOP_2PCT", protect_after=True)
                     return
             else:
+                # V10: migra/corrige baskets de recovery persistidos por versões anteriores.
+                # TP e SL DEVEM ser derivados da entrada da perna de recovery atualmente ativa:
+                #   LONG  -> TP +1%, SL -2%
+                #   SHORT -> TP -1%, SL +2%
+                # Isto evita carregar do state.json um SL antigo/incorreto praticamente colado ao TP.
+                active_recovery_side = str(b.get("active_side") or "")
+                active_recovery_leg = None
+                for _leg in reversed(b.get("legs", [])):
+                    if str(_leg.get("side") or "") == active_recovery_side:
+                        active_recovery_leg = _leg
+                        break
+
+                if active_recovery_leg:
+                    _re = dec(active_recovery_leg.get("entry_price"))
+                    if _re > 0:
+                        expected_rtp = _re * (D(1) + RANGE_TAKE_PROFIT_PCT) if active_recovery_side == "LONG" else _re * (D(1) - RANGE_TAKE_PROFIT_PCT)
+                        expected_rsl = _re * (D(1) - RANGE_HARD_STOP_PCT) if active_recovery_side == "LONG" else _re * (D(1) + RANGE_HARD_STOP_PCT)
+                        stored_rtp = dec(b.get("recovery_tp_price"))
+                        stored_rsl = dec(b.get("recovery_stop_price"))
+
+                        # Qualquer divergência material exige substituir as proteções nativas,
+                        # pois elas podem ter sido criadas com preços herdados incorretos.
+                        tick = dec(self.rules.get(self.symbol, {}).get("tick_size") or "0.00000001")
+                        tol = max(tick * D(2), _re * D("0.000001"))
+                        if abs(stored_rtp - expected_rtp) > tol or abs(stored_rsl - expected_rsl) > tol:
+                            logger.warning(
+                                "RANGE RECOVERY PRICE MIGRATION V10 | %s | side=%s entry=%s | "
+                                "old_tp=%s old_sl=%s -> new_tp=%s new_sl=%s",
+                                self.symbol, active_recovery_side, _re,
+                                stored_rtp, stored_rsl, expected_rtp, expected_rsl,
+                            )
+                            self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+                            self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
+                            b["native_basket_exit"] = None
+                            b["native_basket_stop"] = None
+                            b["recovery_tp_price"] = str(expected_rtp)
+                            b["recovery_stop_price"] = str(expected_rsl)
+                            self.store.save()
+
                 rtp = dec(b.get("recovery_tp_price"))
                 rsl = dec(b.get("recovery_stop_price"))
 
-                # V9: estado persistido não é prova de que a ordem ainda existe na corretora.
+                # V9/V10: estado persistido não é prova de que a ordem ainda existe na corretora.
                 # Confirma TP e SL nativos contra /openOrders e reinstala o lado ausente.
                 if NATIVE_PROTECTIVE_ORDERS and b.get("native_basket_exit") and not self.exe.basket_exit_is_live(self.symbol, b.get("native_basket_exit")):
                     self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
