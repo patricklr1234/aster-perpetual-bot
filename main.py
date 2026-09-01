@@ -110,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.6.0-v4"
+VERSION = "2.6.1-v5"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -2627,13 +2627,70 @@ class Bot:
                 logger.warning("OPEN POSITION DETAIL FAIL | %s", e)
 
     def log_open_positions_detailed(self) -> None:
-        """Mostra estratégia proprietária, exposição, alvo e stop de cada posição real."""
+        """
+        Mostra a atribuição das posições reais às estratégias lógicas.
+
+        Em Hedge Mode a Aster agrega a posição física por symbol+positionSide.
+        Quando SAME_SYMBOL_MULTI_STRATEGY=True, ``symbol_owner`` deixa de ser
+        usado de propósito; portanto o monitor precisa reconstruir a posse a
+        partir dos lotes virtuais RANGE/MACD persistidos no state.
+        """
         positions = self.client.positions()
         found = 0
         with self.store.lock:
-            owners = dict(self.store.state.get("symbol_owner", {}))
             state_range = self.store.state.get("range", {})
             state_macd = self.store.state.get("macd", {})
+            legacy_owners = dict(self.store.state.get("symbol_owner", {}))
+
+        # Reconstrói os lotes virtuais por (symbol, positionSide). Isso evita
+        # classificar como EXTERNA uma posição que o próprio bot acabou de abrir
+        # quando múltiplas estratégias no mesmo símbolo estão habilitadas.
+        logical: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+
+        def add_logical(symbol: str, side: str, strategy: str, vqty: Decimal,
+                        target: Any = "-", stop: Any = "-", recovery: Any = "-") -> None:
+            symbol = str(symbol).upper()
+            side = str(side).upper()
+            if symbol not in SYMBOLS or side not in ("LONG", "SHORT") or vqty <= 0:
+                return
+            logical.setdefault((symbol, side), []).append({
+                "strategy": strategy, "qty": vqty, "target": target,
+                "stop": stop, "recovery": recovery,
+            })
+
+        for symbol, rst in state_range.items():
+            basket = (rst or {}).get("basket") or {}
+            legs = basket.get("legs") or []
+            grouped: Dict[str, Decimal] = {}
+            for leg in legs:
+                side = str(leg.get("side", "")).upper()
+                q = dec(leg.get("qty"))
+                if side in ("LONG", "SHORT") and q > 0:
+                    grouped[side] = grouped.get(side, D(0)) + q
+            for side, q in grouped.items():
+                add_logical(
+                    symbol, side, f"RANGE:{symbol}", q,
+                    basket.get("recovery_tp_price") or basket.get("tp_price") or "-",
+                    basket.get("hard_stop_price") or "-",
+                    basket.get("alternations", 0),
+                )
+
+        for key, mst in state_macd.items():
+            mst = mst or {}
+            pos = mst.get("position") or {}
+            leg = pos.get("leg") or {}
+            symbol = str(mst.get("symbol") or pos.get("symbol") or "").upper()
+            side = str(pos.get("side") or leg.get("side") or "").upper()
+            q = dec(leg.get("qty"))
+            if q > 0:
+                strategy = str(mst.get("strategy") or f"MACD:{key.replace(':', ':')}")
+                add_logical(
+                    symbol, side, strategy, q,
+                    pos.get("tp_price") or "-",
+                    pos.get("stop_price") or "-",
+                    pos.get("recovery_level", mst.get("recovery_level", mst.get("loss_streak", 0))),
+                )
+
         for p in (positions if isinstance(positions, list) else []):
             qty = abs(dec(p.get("positionAmt")))
             if qty <= 0:
@@ -2641,7 +2698,32 @@ class Bot:
             found += 1
             symbol = str(p.get("symbol", "")).upper()
             side = str(p.get("positionSide", "")).upper()
-            owner = owners.get(symbol) or "DESCONHECIDO/EXTERNO"
+            candidates = logical.get((symbol, side), [])
+            virtual_qty = sum((dec(x.get("qty")) for x in candidates), D(0))
+
+            # Tolerância mínima + step do símbolo, para não acusar resíduo por
+            # representação decimal da API.
+            try:
+                step = dec((self.rules.rules.get(symbol) or {}).get("stepSize"))
+            except Exception:
+                step = D(0)
+            tol = max(D("0.00000001"), step)
+            residual = qty - virtual_qty
+
+            if candidates:
+                names = [str(x["strategy"]) for x in candidates]
+                unique_names = list(dict.fromkeys(names))
+                if len(unique_names) == 1:
+                    owner = unique_names[0]
+                else:
+                    owner = "AGREGADA[" + ",".join(unique_names) + "]"
+                if abs(residual) > tol:
+                    owner += f"+RESIDUO_EXTERNO({dstr(residual, 8)})"
+            else:
+                # Compatibilidade com state antigo quando multi-strategy está OFF.
+                legacy = legacy_owners.get(symbol) if not ALLOW_MULTI_STRATEGY_SAME_SYMBOL else None
+                owner = legacy or "DESCONHECIDO/EXTERNO"
+
             entry = dec(p.get("entryPrice"))
             mark = dec(p.get("markPrice"))
             notional = abs(dec(p.get("notional") or qty * mark))
@@ -2653,19 +2735,19 @@ class Bot:
             favorable = move if side == "LONG" else -move
             target = stop = recovery_level = "-"
 
-            if str(owner).startswith("RANGE:"):
-                basket = (state_range.get(symbol) or {}).get("basket") or {}
-                target = basket.get("recovery_tp_price") or basket.get("tp_price") or "-"
-                stop = basket.get("hard_stop_price") or "-"
-                recovery_level = basket.get("alternations", 0)
-            elif str(owner).startswith("MACD:"):
-                pieces = str(owner).split(":")
-                tf = pieces[2] if len(pieces) >= 3 else ""
-                logical = state_macd.get(f"{symbol}:{tf}") or {}
-                pos = logical.get("position") or {}
-                target = pos.get("tp_price") or "-"
-                stop = pos.get("stop_price") or "-"
-                recovery_level = pos.get("recovery_level", logical.get("loss_streak", 0))
+            # Se existe uma única estratégia lógica para esta posição agregada,
+            # mostramos seus níveis diretamente. Com várias estratégias, cada uma
+            # pode ter TP/SL próprio; nesse caso o campo virtual_lots contém o mapa.
+            unique_strategies = list(dict.fromkeys(str(x["strategy"]) for x in candidates))
+            if len(unique_strategies) == 1 and candidates:
+                target = candidates[0].get("target") or "-"
+                stop = candidates[0].get("stop") or "-"
+                recovery_level = candidates[0].get("recovery", "-")
+
+            virtual_lots = ";".join(
+                f"{x['strategy']}:{side}:qty={dstr(dec(x['qty']), 8)},tp={x.get('target','-')},sl={x.get('stop','-')}"
+                for x in candidates
+            ) or "-"
 
             def remaining_pct(raw: Any) -> str:
                 try:
@@ -2688,14 +2770,15 @@ class Bot:
                 pass
 
             logger.warning(
-                "OPEN POSITION | strategy=%s | symbol=%s side=%s qty=%s | entry=%s mark=%s move_favoravel=%s%% | "
-                "notional_usd=%s margin_isolada=%s leverage=%sx unreal_pnl=%s | "
+                "OPEN POSITION | strategy=%s | symbol=%s side=%s qty=%s virtual_qty=%s residual=%s | "
+                "entry=%s mark=%s move_favoravel=%s%% | notional_usd=%s margin_isolada=%s leverage=%sx unreal_pnl=%s | "
                 "tp=%s distancia_tp=%s%% | stop=%s distancia_stop=%s%% | "
-                "liq=%s distancia_liq=%s%% buffer_stop_liq=%s%% | recovery_level=%s",
-                owner, symbol, side, qty, entry, mark, dstr(favorable * D(100), 6),
+                "liq=%s distancia_liq=%s%% buffer_stop_liq=%s%% | recovery_level=%s | virtual_lots=%s",
+                owner, symbol, side, qty, virtual_qty, dstr(residual, 8),
+                entry, mark, dstr(favorable * D(100), 6),
                 notional, margin, leverage, unreal,
                 target, tp_distance, stop, stop_distance,
-                liq, liq_distance, stop_liq_buffer, recovery_level,
+                liq, liq_distance, stop_liq_buffer, recovery_level, virtual_lots,
             )
         if found == 0:
             logger.info("OPEN POSITION | nenhuma posicao real aberta")
