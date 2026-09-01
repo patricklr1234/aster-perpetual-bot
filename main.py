@@ -110,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.6.1-v5"
+VERSION = "2.6.3-v7"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -1606,7 +1606,8 @@ class ExecutionEngine:
                 logger.warning("CANCEL BASKET EXIT FAIL | %s | %s | %s", symbol, cid, e)
 
     def consume_basket_exit(self, strategy_id: str, symbol: str, legs: List[Dict[str, Any]],
-                            native_exit: Optional[Dict[str, Any]], ref_price: Decimal
+                            native_exit: Optional[Dict[str, Any]], ref_price: Decimal,
+                            close_reason: str = "NATIVE_RANGE_BASKET_TAKE_PROFIT"
                             ) -> Optional[Tuple[Decimal, List[Dict[str, Any]]]]:
         if not LIVE_TRADING or not native_exit:
             return None
@@ -1694,7 +1695,7 @@ class ExecutionEngine:
                 raise RuntimeError(f"Native basket exit sem quantidade suficiente para {strategy_id} {ps}")
             cid = str((snapshots.get(ps) or {}).get("clientOrderId") or "NATIVE_BASKET")
             rec = self._close_record(strategy_id, symbol, leg, alloc, side_avg[ps],
-                                     "NATIVE_RANGE_BASKET_TAKE_PROFIT", cid, "ASTER_CONDITIONAL_BASKET")
+                                     close_reason, cid, "ASTER_CONDITIONAL_BASKET")
             closes.append(rec)
             total += dec(rec["pnl_est"])
             remaining_by_side[ps] = remaining_by_side.get(ps, D(0)) - alloc
@@ -1865,6 +1866,7 @@ class RangeEngine:
             "hard_stop_price": str(hard_stop_price),
             "native_bracket": native_bracket,
             "native_basket_exit": None,
+            "native_basket_stop": None,
             "started_at": now_iso(),
         }
         st["last_update"] = now_iso()
@@ -1878,6 +1880,7 @@ class RangeEngine:
             return
         self.exe.cancel_bracket(self.symbol, b.get("native_bracket"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+        self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
         pnl, closes = self.exe.close_legs(self.id, self.symbol, b.get("legs", []), price, reason)
         before = dec(st.get("equity"))
         after = before + pnl
@@ -1932,8 +1935,10 @@ class RangeEngine:
         # the basket and must be removed before the hedge leg is opened.
         self.exe.cancel_bracket(self.symbol, b.get("native_bracket"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+        self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
         b["native_bracket"] = None
         b["native_basket_exit"] = None
+        b["native_basket_stop"] = None
         desired_notional, recovery_tp_signal, existing_at_tp = self.dynamic_recovery_notional(
             st, b, new_side, price, recovery_level
         )
@@ -1965,13 +1970,25 @@ class RangeEngine:
         # Recovery leg seeks 1% in its favor. Native conditional orders are created
         # per aggregated positionSide so every leg of this strategy closes on the same trigger.
         b["recovery_tp_price"] = str(recovery_tp)
+        recovery_stop = recovery_entry * (D(1) - RANGE_HARD_STOP_PCT) if new_side == "LONG" else recovery_entry * (D(1) + RANGE_HARD_STOP_PCT)
+        b["recovery_stop_price"] = str(recovery_stop)
         try:
             b["native_basket_exit"] = self.exe.install_basket_exit(
-                self.id, self.symbol, b["legs"], recovery_tp, recovery_entry
+                self.id + ":TP", self.symbol, b["legs"], recovery_tp, recovery_entry
             )
         except Exception as e:
             b["native_basket_exit"] = None
-            logger.exception("RANGE NATIVE BASKET EXIT FAIL | %s | %s", self.symbol, e)
+            logger.exception("RANGE NATIVE BASKET TP FAIL | %s | %s", self.symbol, e)
+        try:
+            b["native_basket_stop"] = self.exe.install_basket_exit(
+                self.id + ":SL", self.symbol, b["legs"], recovery_stop, recovery_entry
+            )
+        except Exception as e:
+            b["native_basket_stop"] = None
+            logger.exception("RANGE NATIVE BASKET SL FAIL | %s | %s", self.symbol, e)
+        logger.warning("RANGE RECOVERY PROTECTION | %s | TP=%s SL=%s | native_tp=%s native_sl=%s",
+                       self.symbol, recovery_tp, recovery_stop,
+                       bool(b.get("native_basket_exit")), bool(b.get("native_basket_stop")))
         st["last_update"] = now_iso()
         self.store.save()
         logger.warning("RANGE REVERSE 4X DINAMICO | %s | new=%s @%s | mtm=%s existing_at_tp=%s "
@@ -2065,44 +2082,54 @@ class RangeEngine:
                     return
             else:
                 rtp = dec(b.get("recovery_tp_price"))
+                rsl = dec(b.get("recovery_stop_price"))
                 if rtp > 0 and not b.get("native_basket_exit") and NATIVE_PROTECTIVE_ORDERS:
                     try:
-                        b["native_basket_exit"] = self.exe.install_basket_exit(
-                            self.id, self.symbol, b.get("legs", []), rtp, price
-                        )
+                        b["native_basket_exit"] = self.exe.install_basket_exit(self.id + ":TP", self.symbol, b.get("legs", []), rtp, price)
                         self.store.save()
                     except Exception as e:
-                        logger.exception("RANGE BASKET EXIT REINSTALL FAIL | %s | %s", self.symbol, e)
-                if b.get("native_basket_exit"):
-                    native_result = self.exe.consume_basket_exit(
-                        self.id, self.symbol, b.get("legs", []), b.get("native_basket_exit"), price
-                    )
-                    if native_result:
-                        pnl, closes = native_result
-                        before = dec(st.get("equity"))
-                        after = before + pnl
-                        rd_before = dec(st.get("recovery_deficit"))
-                        rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
-                        st["equity"] = str(after)
-                        st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl)
-                        st["recovery_deficit"] = str(rd_after)
-                        st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0)
-                        st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
-                        st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
-                        st["basket"] = None
-                        st["failures"] = 0
-                        st["status"] = "IDLE"
-                        st["anchor"] = str(price)
-                        st["protect_anchor"] = None
-                        st["last_update"] = now_iso()
+                        logger.exception("RANGE BASKET TP REINSTALL FAIL | %s | %s", self.symbol, e)
+                if rsl > 0 and not b.get("native_basket_stop") and NATIVE_PROTECTIVE_ORDERS:
+                    try:
+                        b["native_basket_stop"] = self.exe.install_basket_exit(self.id + ":SL", self.symbol, b.get("legs", []), rsl, price)
                         self.store.save()
-                        release_owner(self.store, self.symbol, self.id)
-                        logger.info("RANGE NATIVE BASKET CLOSE | %s | pnl=%s equity=%s RD=%s",
-                                    self.symbol, pnl, after, rd_after)
-                        return
-                if rtp > 0 and ((active == "LONG" and price >= rtp) or (active == "SHORT" and price <= rtp)):
-                    self._close_basket(price, "RECOVERY_LEG_TP_1PCT_CLOSE_ALL", protect_after=False)
+                    except Exception as e:
+                        logger.exception("RANGE BASKET SL REINSTALL FAIL | %s | %s", self.symbol, e)
+
+                native_result = None
+                if b.get("native_basket_exit"):
+                    native_result = self.exe.consume_basket_exit(self.id, self.symbol, b.get("legs", []), b.get("native_basket_exit"), price, "NATIVE_RANGE_BASKET_TAKE_PROFIT")
+                if native_result:
+                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
+                    pnl, closes = native_result
+                    before = dec(st.get("equity")); after = before + pnl
+                    rd_before = dec(st.get("recovery_deficit")); rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
+                    st["equity"] = str(after); st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl); st["recovery_deficit"] = str(rd_after)
+                    st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0); st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
+                    st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"; st["basket"] = None; st["failures"] = 0; st["status"] = "IDLE"
+                    st["anchor"] = str(price); st["protect_anchor"] = None; st["last_update"] = now_iso(); self.store.save(); release_owner(self.store, self.symbol, self.id)
+                    logger.info("RANGE NATIVE BASKET TP CLOSE | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
                     return
+
+                native_stop = None
+                if b.get("native_basket_stop"):
+                    native_stop = self.exe.consume_basket_exit(self.id, self.symbol, b.get("legs", []), b.get("native_basket_stop"), price, "NATIVE_RANGE_BASKET_STOP_LOSS")
+                if native_stop:
+                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+                    pnl, closes = native_stop
+                    before = dec(st.get("equity")); after = before + pnl
+                    rd_before = dec(st.get("recovery_deficit")); rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
+                    st["equity"] = str(after); st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl); st["recovery_deficit"] = str(rd_after)
+                    st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0); st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
+                    st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"; st["basket"] = None; st["status"] = "PROTECT"
+                    st["protect_anchor"] = str(price); st["anchor"] = str(price); st["last_update"] = now_iso(); self.store.save(); release_owner(self.store, self.symbol, self.id)
+                    logger.warning("RANGE NATIVE BASKET SL CLOSE | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
+                    return
+
+                if rtp > 0 and ((active == "LONG" and price >= rtp) or (active == "SHORT" and price <= rtp)):
+                    self._close_basket(price, "RECOVERY_LEG_TP_1PCT_CLOSE_ALL", protect_after=False); return
+                if rsl > 0 and ((active == "LONG" and price <= rsl) or (active == "SHORT" and price >= rsl)):
+                    self._close_basket(price, "RECOVERY_HARD_STOP_2PCT_CLOSE_ALL", protect_after=True); return
 
             rev = dec(b["next_reverse_price"])
             # Crossing reverse boundary in direction opposite active leg.
@@ -2429,7 +2456,7 @@ class Bot:
     def startup(self) -> None:
         logger.info("=" * 90)
         logger.info("%s | version=%s | LIVE_TRADING=%s", BOT_NAME, VERSION, LIVE_TRADING)
-        logger.info("SYMBOLS=%s | RANGE=%s mode=%s (SEM MACD) | MACD=%s TF=%s",
+        logger.info("SYMBOLS=%s | RANGE=%s mode=%s (100%% VOLATILIDADE, SEM MACD) | MACD_SEPARADO=%s TF=%s",
                     SYMBOLS, RANGE_ENGINE_ENABLED, RANGE_SIGNAL_MODE,
                     MACD_ENGINE_ENABLED, MACD_TIMEFRAMES)
         logger.info("MARGIN=ISOLATED | MODE=HEDGE | MAX_REQUESTED_LEV=%s | BOT_HARD_CAP=%s | API_HARD_CAP=%s",
@@ -2744,10 +2771,33 @@ class Bot:
                 stop = candidates[0].get("stop") or "-"
                 recovery_level = candidates[0].get("recovery", "-")
 
-            virtual_lots = ";".join(
-                f"{x['strategy']}:{side}:qty={dstr(dec(x['qty']), 8)},tp={x.get('target','-')},sl={x.get('stop','-')}"
-                for x in candidates
-            ) or "-"
+            # V6: diagnóstico legível por estratégia virtual. Mostra claramente
+            # se a posição é entrada normal ou recuperação, o multiplicador 4x,
+            # o notional atual e a base configurada da estratégia.
+            virtual_lot_parts = []
+            for x in candidates:
+                x_qty = dec(x.get("qty"))
+                x_recovery_raw = x.get("recovery", 0)
+                try:
+                    x_recovery = max(0, int(x_recovery_raw))
+                except Exception:
+                    x_recovery = 0
+                x_multiplier = RECOVERY_MULTIPLIER ** x_recovery
+                x_base_notional = configured_initial_notional(symbol)
+                x_notional = x_qty * mark if mark > 0 else D(0)
+                x_mode = "NORMAL" if x_recovery == 0 else "RECOVERY"
+                virtual_lot_parts.append(
+                    f"{x['strategy']}:{side}"
+                    f"|qty={dstr(x_qty, 8)}"
+                    f"|notional_usd={dstr(x_notional, 8)}"
+                    f"|mode={x_mode}"
+                    f"|recovery_level={x_recovery}"
+                    f"|multiplier={dstr(x_multiplier, 4)}x"
+                    f"|base_notional_usd={dstr(x_base_notional, 8)}"
+                    f"|tp={x.get('target','-')}"
+                    f"|sl={x.get('stop','-')}"
+                )
+            virtual_lots = ";".join(virtual_lot_parts) or "-"
 
             def remaining_pct(raw: Any) -> str:
                 try:
@@ -2780,6 +2830,25 @@ class Bot:
                 target, tp_distance, stop, stop_distance,
                 liq, liq_distance, stop_liq_buffer, recovery_level, virtual_lots,
             )
+
+            # V6: uma linha separada para cada estratégia facilita leitura no Railway.
+            for x in candidates:
+                x_qty = dec(x.get("qty"))
+                try:
+                    x_recovery = max(0, int(x.get("recovery", 0)))
+                except Exception:
+                    x_recovery = 0
+                x_multiplier = RECOVERY_MULTIPLIER ** x_recovery
+                x_base_notional = configured_initial_notional(symbol)
+                x_notional = x_qty * mark if mark > 0 else D(0)
+                x_mode = "NORMAL" if x_recovery == 0 else "RECOVERY"
+                logger.warning(
+                    "VIRTUAL STRATEGY | strategy=%s | symbol=%s side=%s | qty=%s | notional_usd=%s | "
+                    "mode=%s | recovery_level=%s | multiplier=%sx | base_notional_usd=%s | tp=%s | sl=%s",
+                    x.get("strategy"), symbol, side, dstr(x_qty, 8), dstr(x_notional, 8),
+                    x_mode, x_recovery, dstr(x_multiplier, 4), dstr(x_base_notional, 8),
+                    x.get("target", "-"), x.get("stop", "-"),
+                )
         if found == 0:
             logger.info("OPEN POSITION | nenhuma posicao real aberta")
 
