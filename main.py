@@ -110,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.6.7-v11"
+VERSION = "2.6.8-v12"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -2197,11 +2197,11 @@ class RangeEngine:
 
                         # Qualquer divergência material exige substituir as proteções nativas,
                         # pois elas podem ter sido criadas com preços herdados incorretos.
-                        tick = dec(self.exe.rules.get(self.symbol, {}).get("tick_size") or "0.00000001")
+                        tick = dec(self.exe.rules.rules[self.symbol].tick_size)
                         tol = max(tick * D(2), _re * D("0.000001"))
                         if abs(stored_rtp - expected_rtp) > tol or abs(stored_rsl - expected_rsl) > tol:
                             logger.warning(
-                                "RANGE RECOVERY PRICE MIGRATION V11 | %s | side=%s entry=%s | "
+                                "RANGE RECOVERY PRICE MIGRATION V12 | %s | side=%s entry=%s | "
                                 "old_tp=%s old_sl=%s -> new_tp=%s new_sl=%s",
                                 self.symbol, active_recovery_side, _re,
                                 stored_rtp, stored_rsl, expected_rtp, expected_rsl,
