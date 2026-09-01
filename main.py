@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ASTER PERPETUAL BOT V1 - BTC / ETH / HYPE
+ASTER PERPETUAL BOT V4 - BTC / ETH / HYPE
 =========================================
 
 Motores independentes:
@@ -33,7 +33,10 @@ Seguranca:
   - HARD kill-switch cancela ordens e tenta fechar posicoes do bot.
   - Noticias de alto impacto (3 estrelas) bloqueiam entradas -15/+15 minutos.
   - Estado persistente em BOT_DIR/state.json.
-  - Ordens usam clientOrderId prefixado para reconciliacao.
+  - Ordens usam clientOrderId prefixado por estrategia para reconciliacao.
+  - TP/SL nativos na Aster para posicoes simples (RANGE inicial e MACD).
+  - Estrategias simultaneas no mesmo simbolo habilitadas por padrao; a posicao real
+    continua agregada pela Aster por symbol+positionSide e o bot mantem lotes virtuais.
 
 Dependencias:
   pip install requests websocket-client beautifulsoup4
@@ -107,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.5.1-v3"
+VERSION = "2.6.0-v4"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -178,10 +181,13 @@ REST_PRICE_FALLBACK_SECONDS = float(os.getenv("REST_PRICE_FALLBACK_SECONDS", "5"
 HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "30"))
 ACCOUNT_SYNC_SECONDS = float(os.getenv("ACCOUNT_SYNC_SECONDS", "10"))
 
-# The same Aster Hedge side is aggregated by symbol. To preserve exact per-strategy
-# accounting, default policy allows only one active strategy owner per symbol.
-# Change to 1 only if you accept virtual-lot PnL attribution drift.
-ALLOW_MULTI_STRATEGY_SAME_SYMBOL = os.getenv("ALLOW_MULTI_STRATEGY_SAME_SYMBOL", "0") == "1"
+# Aster Hedge Mode aggregates the real position by symbol+positionSide. This bot
+# supports multiple logical strategies on the same symbol through a virtual-lot book.
+# Per-strategy PnL attribution uses each strategy's confirmed exchange avgPrice.
+ALLOW_MULTI_STRATEGY_SAME_SYMBOL = os.getenv("ALLOW_MULTI_STRATEGY_SAME_SYMBOL", "1") == "1"
+NATIVE_PROTECTIVE_ORDERS = os.getenv("NATIVE_PROTECTIVE_ORDERS", "1") == "1"
+PROTECTIVE_WORKING_TYPE = os.getenv("PROTECTIVE_WORKING_TYPE", "MARK_PRICE").strip().upper()
+PROTECTIVE_PRICE_PROTECT = os.getenv("PROTECTIVE_PRICE_PROTECT", "0") == "1"
 
 # News filter
 NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "1") == "1"
@@ -497,6 +503,45 @@ class AsterClient:
                         continue
             raise
 
+    def conditional_order(self, symbol: str, side: str, position_side: str, quantity: Decimal,
+                          stop_price: Decimal, client_id: str, order_type: str,
+                          working_type: str = "MARK_PRICE", price_protect: bool = False) -> Dict[str, Any]:
+        if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            raise ValueError(f"Tipo condicional invalido: {order_type}")
+        p = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": order_type,
+            "quantity": dstr(quantity, 12),
+            "stopPrice": dstr(stop_price, 12),
+            "workingType": working_type,
+            "priceProtect": "TRUE" if price_protect else "FALSE",
+            "newClientOrderId": client_id[:36],
+            "newOrderRespType": "RESULT",
+        }
+        try:
+            return self._request("POST", "/fapi/v3/order", p, signed=True)
+        except AsterAPIError as e:
+            if e.code == 503:
+                for _ in range(10):
+                    time.sleep(0.5)
+                    try:
+                        return self.query_order(symbol, client_id)
+                    except Exception:
+                        continue
+            raise
+
+    def cancel_order(self, symbol: str, client_id: str) -> Any:
+        try:
+            return self._request("DELETE", "/fapi/v3/order",
+                                 {"symbol": symbol, "origClientOrderId": client_id}, signed=True)
+        except AsterAPIError as e:
+            # -2011 / -2013 are harmless when the sibling already triggered/cancelled.
+            if e.code in (-2011, -2013):
+                return {"status": "UNKNOWN_OR_GONE", "clientOrderId": client_id}
+            raise
+
     def cancel_all(self, symbol: str) -> Any:
         return self._request("DELETE", "/fapi/v3/allOpenOrders", {"symbol": symbol}, signed=True)
 
@@ -573,6 +618,15 @@ class RulesBook:
         if q > r.max_qty:
             raise RuntimeError(f"Quantidade acima maxQty {symbol}: {q}>{r.max_qty}")
         return q
+
+    def trigger_price(self, symbol: str, raw: Decimal, direction: str) -> Decimal:
+        """Normaliza stop/TP ao tick sem deslocar o gatilho para o lado perigoso."""
+        r = self.rules[symbol]
+        if direction == "UP":
+            return ceil_step(raw, r.tick_size)
+        if direction == "DOWN":
+            return floor_step(raw, r.tick_size)
+        return floor_step(raw, r.tick_size)
 
 # -----------------------------------------------------------------------------
 # MARKET DATA WEBSOCKET + REST FALLBACK
@@ -1235,7 +1289,7 @@ class AccountManager:
 # -----------------------------------------------------------------------------
 
 class ExecutionEngine:
-    PREFIX = "a2"
+    PREFIX = "a3"
 
     def __init__(self, client: AsterClient, account: AccountManager, rules: RulesBook, store: StateStore):
         self.client = client
@@ -1256,19 +1310,20 @@ class ExecutionEngine:
             return "BUY" if opening else "SELL"
         return "SELL" if opening else "BUY"
 
-    def _fill_from_response(self, symbol: str, resp: Dict[str, Any], client_id: str, fallback_price: Decimal) -> Tuple[Decimal, Decimal]:
+    def _fill_from_response(self, symbol: str, resp: Dict[str, Any], client_id: str,
+                            fallback_price: Decimal) -> Tuple[Decimal, Decimal]:
         status = str(resp.get("status", ""))
-        qty = dec(resp.get("executedQty") or resp.get("origQty"))
-        avg = dec(resp.get("avgPrice") or resp.get("price"))
+        qty = dec(resp.get("executedQty"))
+        avg = dec(resp.get("avgPrice"))
         end = time.time() + ORDER_FILL_WAIT_SECONDS
         while (status not in ("FILLED", "PARTIALLY_FILLED") or qty <= 0 or avg <= 0) and time.time() < end:
             try:
                 q = self.client.query_order(symbol, client_id)
                 status = str(q.get("status", status))
-                qty = dec(q.get("executedQty") or q.get("origQty") or qty)
-                avg = dec(q.get("avgPrice") or q.get("price") or avg)
+                qty = dec(q.get("executedQty") or qty)
+                avg = dec(q.get("avgPrice") or avg)
                 resp = q
-                if status == "FILLED" and qty > 0:
+                if status == "FILLED" and qty > 0 and avg > 0:
                     break
             except Exception:
                 pass
@@ -1276,22 +1331,29 @@ class ExecutionEngine:
         if qty <= 0:
             raise RuntimeError(f"Ordem sem fill confirmado: {symbol} client_id={client_id} status={status}")
         if avg <= 0:
+            # MARKET should report avgPrice. Fallback is logged explicitly so it is never
+            # confused with an exchange-confirmed fill.
             avg = fallback_price
+            logger.warning("FILL AVG AUSENTE | %s | cid=%s | usando ref_price=%s", symbol, client_id, fallback_price)
         return qty, avg
 
     def market(self, strategy_id: str, symbol: str, position_side: str, qty: Decimal,
                opening: bool, ref_price: Decimal) -> Dict[str, Any]:
-        side = self.order_side(position_side, opening)
-        cid = self.client_id(strategy_id, "open" if opening else "close")
-        if not LIVE_TRADING:
-            logger.info("SIM ORDER | %s | %s %s posSide=%s qty=%s px~%s cid=%s",
-                        strategy_id, "OPEN" if opening else "CLOSE", side, position_side, qty, ref_price, cid)
-            return {"qty": qty, "price": ref_price, "client_id": cid, "order_id": f"SIM-{cid}", "status": "FILLED", "time": now_ms()}
-        resp = self.client.order(symbol, side, position_side, qty, cid, "MARKET")
-        filled, avg = self._fill_from_response(symbol, resp, cid, ref_price)
-        logger.info("ORDER FILLED | %s | %s %s posSide=%s qty=%s avg=%s cid=%s",
-                    strategy_id, "OPEN" if opening else "CLOSE", side, position_side, filled, avg, cid)
-        return {"qty": filled, "price": avg, "client_id": cid, "order_id": resp.get("orderId"), "status": resp.get("status"), "time": now_ms()}
+        with self.lock:
+            side = self.order_side(position_side, opening)
+            cid = self.client_id(strategy_id, "open" if opening else "close")
+            if not LIVE_TRADING:
+                logger.info("SIM ORDER | %s | %s %s posSide=%s qty=%s px~%s cid=%s",
+                            strategy_id, "OPEN" if opening else "CLOSE", side, position_side, qty, ref_price, cid)
+                return {"qty": qty, "price": ref_price, "client_id": cid,
+                        "order_id": f"SIM-{cid}", "status": "FILLED", "time": now_ms(),
+                        "price_source": "SIM_REF"}
+            resp = self.client.order(symbol, side, position_side, qty, cid, "MARKET")
+            filled, avg = self._fill_from_response(symbol, resp, cid, ref_price)
+            logger.info("ORDER FILLED | %s | %s %s posSide=%s requested_qty=%s filled_qty=%s avg=%s cid=%s",
+                        strategy_id, "OPEN" if opening else "CLOSE", side, position_side, qty, filled, avg, cid)
+            return {"qty": filled, "price": avg, "client_id": cid, "order_id": resp.get("orderId"),
+                    "status": resp.get("status"), "time": now_ms(), "price_source": "EXCHANGE_AVG"}
 
     def open_leg(self, strategy_id: str, symbol: str, position_side: str, sizing: Dict[str, Any],
                  reason: str) -> Dict[str, Any]:
@@ -1302,21 +1364,22 @@ class ExecutionEngine:
             "side": position_side,
             "qty": str(fill["qty"]),
             "entry_price": str(fill["price"]),
+            "signal_price": str(sizing["price"]),
+            "price_source": fill.get("price_source", "UNKNOWN"),
             "leverage": sizing["leverage"],
             "notional": str(fill["qty"] * fill["price"]),
             "margin_est": str((fill["qty"] * fill["price"]) / D(sizing["leverage"])),
             "opened_at": now_iso(),
             "reason": reason,
         }
-        jsonl_append(TRADES_FILE, {"event": "OPEN", "strategy": strategy_id, "symbol": symbol, "leg": leg, "at": now_iso()})
+        jsonl_append(TRADES_FILE, {"event": "OPEN", "strategy": strategy_id, "symbol": symbol,
+                                  "leg": leg, "at": now_iso()})
         return leg
 
-    def close_leg(self, strategy_id: str, symbol: str, leg: Dict[str, Any], ref_price: Decimal, reason: str) -> Dict[str, Any]:
-        qty = dec(leg["qty"])
-        fill = self.market(strategy_id, symbol, leg["side"], qty, False, ref_price)
+    def _close_record(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
+                      closed_qty: Decimal, exitp: Decimal, reason: str,
+                      close_client_id: str, exit_source: str) -> Dict[str, Any]:
         entry = dec(leg["entry_price"])
-        exitp = fill["price"]
-        closed_qty = min(qty, fill["qty"])
         gross = (exitp - entry) * closed_qty if leg["side"] == "LONG" else (entry - exitp) * closed_qty
         fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
         fees_est = (entry * closed_qty + exitp * closed_qty) * fee_rate
@@ -1325,14 +1388,23 @@ class ExecutionEngine:
             "leg_id": leg["id"], "side": leg["side"], "qty": str(closed_qty),
             "entry_price": str(entry), "exit_price": str(exitp), "gross": str(gross),
             "fees_est": str(fees_est), "pnl_est": str(pnl), "reason": reason,
-            "closed_at": now_iso(), "close_client_id": fill["client_id"],
+            "closed_at": now_iso(), "close_client_id": close_client_id,
+            "exit_source": exit_source,
         }
-        jsonl_append(TRADES_FILE, {"event": "CLOSE", "strategy": strategy_id, "symbol": symbol, "close": rec, "at": now_iso()})
+        jsonl_append(TRADES_FILE, {"event": "CLOSE", "strategy": strategy_id, "symbol": symbol,
+                                  "close": rec, "at": now_iso()})
         return rec
 
-    def close_legs(self, strategy_id: str, symbol: str, legs: List[Dict[str, Any]], ref_price: Decimal, reason: str) -> Tuple[Decimal, List[Dict[str, Any]]]:
-        # Close both sides near-simultaneously: execute larger notional winner/loser sequentially under lock.
-        # API batch order could be used, but per-order reconciliation is safer on HTTP 503 UNKNOWN.
+    def close_leg(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
+                  ref_price: Decimal, reason: str) -> Dict[str, Any]:
+        qty = dec(leg["qty"])
+        fill = self.market(strategy_id, symbol, leg["side"], qty, False, ref_price)
+        closed_qty = min(qty, fill["qty"])
+        return self._close_record(strategy_id, symbol, leg, closed_qty, fill["price"], reason,
+                                  fill["client_id"], fill.get("price_source", "MARKET"))
+
+    def close_legs(self, strategy_id: str, symbol: str, legs: List[Dict[str, Any]],
+                   ref_price: Decimal, reason: str) -> Tuple[Decimal, List[Dict[str, Any]]]:
         closes = []
         total = D(0)
         for leg in list(legs):
@@ -1343,6 +1415,291 @@ class ExecutionEngine:
             except Exception as e:
                 logger.exception("CLOSE LEG FAIL | %s | leg=%s | %s", strategy_id, leg.get("id"), e)
                 raise
+        return total, closes
+
+    def install_bracket(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
+                        tp_price: Decimal, stop_price: Decimal) -> Optional[Dict[str, Any]]:
+        if not NATIVE_PROTECTIVE_ORDERS:
+            return None
+        side = leg["side"]
+        qty = dec(leg["qty"])
+        if qty <= 0:
+            return None
+        if side == "LONG":
+            tp = self.rules.trigger_price(symbol, tp_price, "UP")
+            sl = self.rules.trigger_price(symbol, stop_price, "DOWN")
+        else:
+            tp = self.rules.trigger_price(symbol, tp_price, "DOWN")
+            sl = self.rules.trigger_price(symbol, stop_price, "UP")
+        close_side = self.order_side(side, False)
+        tp_cid = self.client_id(strategy_id, "tp")
+        sl_cid = self.client_id(strategy_id, "stop")
+        if not LIVE_TRADING:
+            logger.info("SIM BRACKET | %s | %s %s qty=%s TP=%s SL=%s", strategy_id, symbol, side, qty, tp, sl)
+            return {
+                "tp": {"client_id": tp_cid, "stop_price": str(tp), "type": "TAKE_PROFIT_MARKET", "status": "NEW"},
+                "sl": {"client_id": sl_cid, "stop_price": str(sl), "type": "STOP_MARKET", "status": "NEW"},
+                "working_type": PROTECTIVE_WORKING_TYPE,
+                "installed_at": now_iso(),
+            }
+        tp_resp = self.client.conditional_order(
+            symbol, close_side, side, qty, tp, tp_cid, "TAKE_PROFIT_MARKET",
+            PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT,
+        )
+        try:
+            sl_resp = self.client.conditional_order(
+                symbol, close_side, side, qty, sl, sl_cid, "STOP_MARKET",
+                PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT,
+            )
+        except Exception:
+            try:
+                self.client.cancel_order(symbol, tp_cid)
+            except Exception:
+                pass
+            raise
+        bracket = {
+            "tp": {"client_id": tp_cid, "order_id": tp_resp.get("orderId"), "stop_price": str(tp),
+                   "type": "TAKE_PROFIT_MARKET", "status": tp_resp.get("status", "NEW")},
+            "sl": {"client_id": sl_cid, "order_id": sl_resp.get("orderId"), "stop_price": str(sl),
+                   "type": "STOP_MARKET", "status": sl_resp.get("status", "NEW")},
+            "working_type": PROTECTIVE_WORKING_TYPE,
+            "installed_at": now_iso(),
+        }
+        logger.info("NATIVE BRACKET | %s | %s %s qty=%s | TP=%s cid=%s | SL=%s cid=%s",
+                    strategy_id, symbol, side, qty, tp, tp_cid, sl, sl_cid)
+        return bracket
+
+    def cancel_bracket(self, symbol: str, bracket: Optional[Dict[str, Any]]) -> None:
+        if not bracket or not LIVE_TRADING:
+            return
+        for key in ("tp", "sl"):
+            cid = str((bracket.get(key) or {}).get("client_id") or "")
+            if not cid:
+                continue
+            try:
+                self.client.cancel_order(symbol, cid)
+            except Exception as e:
+                logger.warning("CANCEL PROTECTION FAIL | %s | %s | %s", symbol, cid, e)
+
+    def consume_bracket_fill(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
+                             bracket: Optional[Dict[str, Any]], ref_price: Decimal) -> Optional[Dict[str, Any]]:
+        if not LIVE_TRADING or not bracket:
+            return None
+        triggered_key = None
+        triggered = None
+        for key in ("tp", "sl"):
+            meta = bracket.get(key) or {}
+            cid = str(meta.get("client_id") or "")
+            if not cid:
+                continue
+            try:
+                q = self.client.query_order(symbol, cid)
+            except AsterAPIError as e:
+                if e.code in (-2011, -2013):
+                    continue
+                raise
+            status = str(q.get("status", ""))
+            meta["status"] = status
+            if status in ("FILLED", "PARTIALLY_FILLED") and dec(q.get("executedQty")) > 0:
+                triggered_key = key
+                triggered = q
+                break
+        if not triggered:
+            return None
+
+        sibling = "sl" if triggered_key == "tp" else "tp"
+        sibling_cid = str((bracket.get(sibling) or {}).get("client_id") or "")
+        if sibling_cid:
+            try:
+                self.client.cancel_order(symbol, sibling_cid)
+            except Exception as e:
+                logger.warning("CANCEL SIBLING FAIL | %s | %s | %s", strategy_id, sibling_cid, e)
+
+        requested_qty = dec(leg["qty"])
+        filled_qty = min(requested_qty, dec(triggered.get("executedQty")))
+        avg = dec(triggered.get("avgPrice"))
+        if avg <= 0:
+            avg = ref_price
+            logger.warning("NATIVE EXIT AVG AUSENTE | %s | cid=%s | ref=%s",
+                           strategy_id, triggered.get("clientOrderId"), ref_price)
+
+        # STOP_MARKET/TP_MARKET normally fills fully. If an exchange reports a partial
+        # fill, close only the remainder with a market order instead of leaving exposure.
+        if filled_qty < requested_qty:
+            remaining = requested_qty - filled_qty
+            fallback = self.market(strategy_id, symbol, leg["side"], remaining, False, ref_price)
+            total_qty = filled_qty + fallback["qty"]
+            if total_qty > 0:
+                avg = (avg * filled_qty + fallback["price"] * fallback["qty"]) / total_qty
+                filled_qty = total_qty
+
+        reason = "NATIVE_TAKE_PROFIT" if triggered_key == "tp" else "NATIVE_STOP_LOSS"
+        logger.warning("NATIVE EXIT FILLED | %s | %s | qty=%s avg=%s",
+                       strategy_id, reason, filled_qty, avg)
+        return self._close_record(
+            strategy_id, symbol, leg, min(requested_qty, filled_qty), avg, reason,
+            str(triggered.get("clientOrderId") or (bracket.get(triggered_key) or {}).get("client_id") or ""),
+            "ASTER_CONDITIONAL",
+        )
+
+    def install_basket_exit(self, strategy_id: str, symbol: str, legs: List[Dict[str, Any]],
+                            target_price: Decimal, ref_price: Decimal) -> Optional[Dict[str, Any]]:
+        """Cria saídas nativas por positionSide para fechar um basket inteiro no mesmo gatilho."""
+        if not NATIVE_PROTECTIVE_ORDERS or not legs:
+            return None
+        target_direction = "UP" if target_price >= ref_price else "DOWN"
+        trigger = self.rules.trigger_price(symbol, target_price, target_direction)
+        grouped: Dict[str, Decimal] = {}
+        for leg in legs:
+            side = str(leg["side"])
+            grouped[side] = grouped.get(side, D(0)) + dec(leg["qty"])
+        orders: List[Dict[str, Any]] = []
+        placed: List[str] = []
+        try:
+            for position_side, qty in grouped.items():
+                close_side = self.order_side(position_side, False)
+                if target_direction == "UP":
+                    order_type = "TAKE_PROFIT_MARKET" if position_side == "LONG" else "STOP_MARKET"
+                else:
+                    order_type = "STOP_MARKET" if position_side == "LONG" else "TAKE_PROFIT_MARKET"
+                cid = self.client_id(strategy_id, f"bx{position_side[0].lower()}")
+                if not LIVE_TRADING:
+                    resp = {"orderId": f"SIM-{cid}", "status": "NEW"}
+                else:
+                    resp = self.client.conditional_order(
+                        symbol, close_side, position_side, qty, trigger, cid, order_type,
+                        PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT,
+                    )
+                    placed.append(cid)
+                orders.append({
+                    "position_side": position_side,
+                    "qty": str(qty),
+                    "client_id": cid,
+                    "order_id": resp.get("orderId"),
+                    "type": order_type,
+                    "stop_price": str(trigger),
+                    "status": resp.get("status", "NEW"),
+                })
+        except Exception:
+            if LIVE_TRADING:
+                for cid in placed:
+                    try:
+                        self.client.cancel_order(symbol, cid)
+                    except Exception:
+                        pass
+            raise
+        logger.info("NATIVE BASKET EXIT | %s | %s target=%s orders=%s",
+                    strategy_id, symbol, trigger,
+                    [(x["position_side"], x["qty"], x["type"], x["client_id"]) for x in orders])
+        return {"target_price": str(trigger), "orders": orders, "installed_at": now_iso()}
+
+    def cancel_basket_exit(self, symbol: str, native_exit: Optional[Dict[str, Any]]) -> None:
+        if not native_exit or not LIVE_TRADING:
+            return
+        for meta in native_exit.get("orders", []):
+            cid = str(meta.get("client_id") or "")
+            if not cid:
+                continue
+            try:
+                self.client.cancel_order(symbol, cid)
+            except Exception as e:
+                logger.warning("CANCEL BASKET EXIT FAIL | %s | %s | %s", symbol, cid, e)
+
+    def consume_basket_exit(self, strategy_id: str, symbol: str, legs: List[Dict[str, Any]],
+                            native_exit: Optional[Dict[str, Any]], ref_price: Decimal
+                            ) -> Optional[Tuple[Decimal, List[Dict[str, Any]]]]:
+        if not LIVE_TRADING or not native_exit:
+            return None
+        orders = native_exit.get("orders", [])
+        snapshots: Dict[str, Dict[str, Any]] = {}
+        any_fill = False
+        for meta in orders:
+            cid = str(meta.get("client_id") or "")
+            if not cid:
+                continue
+            try:
+                q = self.client.query_order(symbol, cid)
+            except AsterAPIError as e:
+                if e.code in (-2011, -2013):
+                    continue
+                raise
+            snapshots[str(meta["position_side"])] = q
+            meta["status"] = str(q.get("status", ""))
+            if meta["status"] in ("FILLED", "PARTIALLY_FILLED") and dec(q.get("executedQty")) > 0:
+                any_fill = True
+        if not any_fill:
+            return None
+
+        # Give the other side a short chance to execute on the same exchange trigger.
+        deadline = time.time() + min(2.0, ORDER_FILL_WAIT_SECONDS)
+        while time.time() < deadline:
+            pending = False
+            for meta in orders:
+                ps = str(meta["position_side"])
+                q = snapshots.get(ps, {})
+                if str(q.get("status", "")) == "FILLED":
+                    continue
+                cid = str(meta.get("client_id") or "")
+                try:
+                    q = self.client.query_order(symbol, cid)
+                    snapshots[ps] = q
+                    meta["status"] = str(q.get("status", ""))
+                except Exception:
+                    pass
+                if str((snapshots.get(ps) or {}).get("status", "")) != "FILLED":
+                    pending = True
+            if not pending:
+                break
+            time.sleep(ORDER_POLL_SECONDS)
+
+        # Cancel every still-open conditional before fallback market closure.
+        for meta in orders:
+            ps = str(meta["position_side"])
+            q = snapshots.get(ps, {})
+            if str(q.get("status", "")) != "FILLED":
+                cid = str(meta.get("client_id") or "")
+                if cid:
+                    try:
+                        self.client.cancel_order(symbol, cid)
+                    except Exception:
+                        pass
+
+        side_avg: Dict[str, Decimal] = {}
+        side_qty: Dict[str, Decimal] = {}
+        for meta in orders:
+            ps = str(meta["position_side"])
+            wanted = dec(meta.get("qty"))
+            q = snapshots.get(ps, {})
+            filled = min(wanted, dec(q.get("executedQty")))
+            avg = dec(q.get("avgPrice"))
+            if filled > 0 and avg <= 0:
+                avg = ref_price
+            remaining = max(D(0), wanted - filled)
+            if remaining > 0:
+                fallback = self.market(strategy_id, symbol, ps, remaining, False, ref_price)
+                totalq = filled + fallback["qty"]
+                avg = ((avg * filled) + (fallback["price"] * fallback["qty"])) / totalq if totalq > 0 else ref_price
+                filled = totalq
+            side_avg[ps] = avg if avg > 0 else ref_price
+            side_qty[ps] = filled
+
+        closes: List[Dict[str, Any]] = []
+        total = D(0)
+        remaining_by_side = dict(side_qty)
+        for leg in legs:
+            ps = str(leg["side"])
+            leg_qty = dec(leg["qty"])
+            alloc = min(leg_qty, remaining_by_side.get(ps, D(0)))
+            if alloc <= 0:
+                raise RuntimeError(f"Native basket exit sem quantidade suficiente para {strategy_id} {ps}")
+            cid = str((snapshots.get(ps) or {}).get("clientOrderId") or "NATIVE_BASKET")
+            rec = self._close_record(strategy_id, symbol, leg, alloc, side_avg[ps],
+                                     "NATIVE_RANGE_BASKET_TAKE_PROFIT", cid, "ASTER_CONDITIONAL_BASKET")
+            closes.append(rec)
+            total += dec(rec["pnl_est"])
+            remaining_by_side[ps] = remaining_by_side.get(ps, D(0)) - alloc
+        logger.warning("NATIVE BASKET EXIT FILLED | %s | pnl=%s | target=%s",
+                       strategy_id, total, native_exit.get("target_price"))
         return total, closes
 
 # -----------------------------------------------------------------------------
@@ -1489,28 +1846,38 @@ class RangeEngine:
         if not leg:
             return
         anchor = dec(st["anchor"])
+        entry = dec(leg["entry_price"])
+        tp_price = entry * (D(1) + RANGE_TAKE_PROFIT_PCT) if side == "LONG" else entry * (D(1) - RANGE_TAKE_PROFIT_PCT)
+        hard_stop_price = entry * (D(1) - RANGE_HARD_STOP_PCT) if side == "LONG" else entry * (D(1) + RANGE_HARD_STOP_PCT)
+        native_bracket = self.exe.install_bracket(self.id, self.symbol, leg, tp_price, hard_stop_price)
         st["status"] = "BASKET"
         st["basket"] = {
             "origin_anchor": str(anchor),
             "initial_side": side,
-            "initial_entry": str(price),
+            "signal_entry": str(price),
+            "initial_entry": str(entry),
             "legs": [leg],
             "active_side": side,
             "alternations": 0,
-            # Current opposite trigger is zero/origin anchor.
+            # Current opposite trigger remains the strategy zero/origin anchor.
             "next_reverse_price": str(anchor),
-            "tp_price": str(price * (D(1) + RANGE_TAKE_PROFIT_PCT) if side == "LONG" else price * (D(1) - RANGE_TAKE_PROFIT_PCT)),
-            "hard_stop_price": str(price * (D(1) - RANGE_HARD_STOP_PCT) if side == "LONG" else price * (D(1) + RANGE_HARD_STOP_PCT)),
+            "tp_price": str(tp_price),
+            "hard_stop_price": str(hard_stop_price),
+            "native_bracket": native_bracket,
+            "native_basket_exit": None,
             "started_at": now_iso(),
         }
         st["last_update"] = now_iso()
         self.store.save()
-        logger.info("RANGE BASKET START | %s | %s @ %s | anchor=%s", self.symbol, side, price, anchor)
+        logger.info("RANGE BASKET START | %s | %s signal=%s fill=%s | anchor=%s TP=%s SL=%s",
+                    self.symbol, side, price, entry, anchor, tp_price, hard_stop_price)
 
     def _close_basket(self, price: Decimal, reason: str, protect_after: bool = False) -> None:
         st = self.st(); b = st.get("basket")
         if not b:
             return
+        self.exe.cancel_bracket(self.symbol, b.get("native_bracket"))
+        self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
         pnl, closes = self.exe.close_legs(self.id, self.symbol, b.get("legs", []), price, reason)
         before = dec(st.get("equity"))
         after = before + pnl
@@ -1561,14 +1928,31 @@ class RangeEngine:
         if target <= 0:
             target = None
         recovery_level = min(int(b.get("alternations", 0)) + 1, MAX_RECOVERY_FAILURES)
-        desired_notional, recovery_tp, existing_at_tp = self.dynamic_recovery_notional(
+        # Once recovery starts, the original single-leg native TP/SL no longer represents
+        # the basket and must be removed before the hedge leg is opened.
+        self.exe.cancel_bracket(self.symbol, b.get("native_bracket"))
+        self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+        b["native_bracket"] = None
+        b["native_basket_exit"] = None
+        desired_notional, recovery_tp_signal, existing_at_tp = self.dynamic_recovery_notional(
             st, b, new_side, price, recovery_level
         )
         leg = self._open(new_side, price, target, "RANGE_ALTERNATING_RECOVERY",
                          recovery_level=recovery_level,
                          desired_notional_override=desired_notional)
         if not leg:
+            # Reinstall protection for the still-single basket if the recovery order failed.
+            if len(b.get("legs", [])) == 1:
+                original_leg = b["legs"][0]
+                b["native_bracket"] = self.exe.install_bracket(
+                    self.id, self.symbol, original_leg,
+                    dec(b.get("tp_price")), dec(b.get("hard_stop_price")),
+                )
+                self.store.save()
             return
+        recovery_entry = dec(leg["entry_price"])
+        recovery_tp = recovery_entry * (D(1) + RANGE_TAKE_PROFIT_PCT) \
+            if new_side == "LONG" else recovery_entry * (D(1) - RANGE_TAKE_PROFIT_PCT)
         b["legs"].append(leg)
         b["active_side"] = new_side
         b["alternations"] = int(b.get("alternations", 0)) + 1
@@ -1578,13 +1962,21 @@ class RangeEngine:
             b["next_reverse_price"] = b["origin_anchor"]
         else:
             b["next_reverse_price"] = b["initial_entry"]
-        # Recovery leg seeks 1% in its favor. When hit, close all legs together.
+        # Recovery leg seeks 1% in its favor. Native conditional orders are created
+        # per aggregated positionSide so every leg of this strategy closes on the same trigger.
         b["recovery_tp_price"] = str(recovery_tp)
+        try:
+            b["native_basket_exit"] = self.exe.install_basket_exit(
+                self.id, self.symbol, b["legs"], recovery_tp, recovery_entry
+            )
+        except Exception as e:
+            b["native_basket_exit"] = None
+            logger.exception("RANGE NATIVE BASKET EXIT FAIL | %s | %s", self.symbol, e)
         st["last_update"] = now_iso()
         self.store.save()
         logger.warning("RANGE REVERSE 4X DINAMICO | %s | new=%s @%s | mtm=%s existing_at_tp=%s "
                        "desired_notional=%s recovery_tp=%s failures=%s",
-                       self.symbol, new_side, price, mtm, existing_at_tp,
+                       self.symbol, new_side, recovery_entry, mtm, existing_at_tp,
                        desired_notional, recovery_tp, st["failures"])
 
     def tick(self, price: Decimal) -> None:
@@ -1624,6 +2016,43 @@ class RangeEngine:
 
             active = b["active_side"]
             alternations = int(b.get("alternations", 0))
+            if alternations == 0 and not b.get("native_bracket") and NATIVE_PROTECTIVE_ORDERS:
+                try:
+                    b["native_bracket"] = self.exe.install_bracket(
+                        self.id, self.symbol, b["legs"][0],
+                        dec(b.get("tp_price")), dec(b.get("hard_stop_price")),
+                    )
+                    self.store.save()
+                except Exception as e:
+                    logger.exception("RANGE BRACKET INSTALL FAIL | %s | %s", self.symbol, e)
+            if alternations == 0 and b.get("native_bracket"):
+                native_close = self.exe.consume_bracket_fill(
+                    self.id, self.symbol, b["legs"][0], b.get("native_bracket"), price
+                )
+                if native_close:
+                    pnl = dec(native_close["pnl_est"])
+                    before = dec(st.get("equity"))
+                    after = before + pnl
+                    rd_before = dec(st.get("recovery_deficit"))
+                    rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
+                    st["equity"] = str(after)
+                    st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl)
+                    st["recovery_deficit"] = str(rd_after)
+                    st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0)
+                    st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
+                    st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+                    protect_after = pnl < 0
+                    st["basket"] = None
+                    st["failures"] = 0
+                    st["status"] = "PROTECT" if protect_after else "IDLE"
+                    st["protect_anchor"] = str(dec(native_close["exit_price"])) if protect_after else None
+                    st["anchor"] = str(dec(native_close["exit_price"]))
+                    st["last_update"] = now_iso()
+                    self.store.save()
+                    release_owner(self.store, self.symbol, self.id)
+                    logger.info("RANGE NATIVE CLOSE | %s | pnl=%s equity=%s RD=%s protect=%s",
+                                self.symbol, pnl, after, rd_after, protect_after)
+                    return
             if alternations == 0:
                 tp = dec(b["tp_price"])
                 hard = dec(b["hard_stop_price"])
@@ -1636,6 +2065,41 @@ class RangeEngine:
                     return
             else:
                 rtp = dec(b.get("recovery_tp_price"))
+                if rtp > 0 and not b.get("native_basket_exit") and NATIVE_PROTECTIVE_ORDERS:
+                    try:
+                        b["native_basket_exit"] = self.exe.install_basket_exit(
+                            self.id, self.symbol, b.get("legs", []), rtp, price
+                        )
+                        self.store.save()
+                    except Exception as e:
+                        logger.exception("RANGE BASKET EXIT REINSTALL FAIL | %s | %s", self.symbol, e)
+                if b.get("native_basket_exit"):
+                    native_result = self.exe.consume_basket_exit(
+                        self.id, self.symbol, b.get("legs", []), b.get("native_basket_exit"), price
+                    )
+                    if native_result:
+                        pnl, closes = native_result
+                        before = dec(st.get("equity"))
+                        after = before + pnl
+                        rd_before = dec(st.get("recovery_deficit"))
+                        rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
+                        st["equity"] = str(after)
+                        st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl)
+                        st["recovery_deficit"] = str(rd_after)
+                        st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0)
+                        st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
+                        st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+                        st["basket"] = None
+                        st["failures"] = 0
+                        st["status"] = "IDLE"
+                        st["anchor"] = str(price)
+                        st["protect_anchor"] = None
+                        st["last_update"] = now_iso()
+                        self.store.save()
+                        release_owner(self.store, self.symbol, self.id)
+                        logger.info("RANGE NATIVE BASKET CLOSE | %s | pnl=%s equity=%s RD=%s",
+                                    self.symbol, pnl, after, rd_after)
+                        return
                 if rtp > 0 and ((active == "LONG" and price >= rtp) or (active == "SHORT" and price <= rtp)):
                     self._close_basket(price, "RECOVERY_LEG_TP_1PCT_CLOSE_ALL", protect_after=False)
                     return
@@ -1674,6 +2138,7 @@ class MacdEngine:
         st = self.st(); pos = st.get("position")
         if not pos:
             return
+        self.exe.cancel_bracket(self.symbol, pos.get("native_bracket"))
         c = self.exe.close_leg(self.id, self.symbol, pos["leg"], price, reason)
         pnl = dec(c["pnl_est"])
         eq = dec(st["equity"]) + pnl
@@ -1743,9 +2208,12 @@ class MacdEngine:
         entry = dec(leg["entry_price"])
         tp_price = entry * (D(1) + MACD_TAKE_PROFIT_PCT) if side == "LONG" else entry * (D(1) - MACD_TAKE_PROFIT_PCT)
         stop_price = entry * (D(1) - MACD_HARD_STOP_PCT) if side == "LONG" else entry * (D(1) + MACD_HARD_STOP_PCT)
+        native_bracket = self.exe.install_bracket(self.id, self.symbol, leg, tp_price, stop_price)
         st["position"] = {
             "side": side, "leg": leg, "opened_at": now_iso(),
+            "signal_price": str(price),
             "tp_price": str(tp_price), "stop_price": str(stop_price),
+            "native_bracket": native_bracket,
             "recovery_level": recovery_level,
         }
         st["last_update"] = now_iso()
@@ -1762,6 +2230,59 @@ class MacdEngine:
         # aguardando um cruzamento MACD contrario.
         pos = st.get("position")
         if pos:
+            # First reconcile exchange-native protection. This prevents a second market
+            # close when the Aster TP/SL has already executed between bot ticks.
+            if pos.get("native_bracket"):
+                native_close = self.exe.consume_bracket_fill(
+                    self.id, self.symbol, pos["leg"], pos.get("native_bracket"), price
+                )
+                if native_close:
+                    pnl = dec(native_close["pnl_est"])
+                    eq = dec(st["equity"]) + pnl
+                    st["equity"] = str(eq)
+                    st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl)
+                    rd = dec(st.get("recovery_deficit"))
+                    if pnl < 0:
+                        rd += -pnl
+                        st["loss_streak"] = int(st.get("loss_streak", 0)) + 1
+                        st["recovery_level"] = min(
+                            MAX_RECOVERY_FAILURES,
+                            max(1, int(st.get("recovery_level", 0)) + 1),
+                        )
+                        st["losses"] = int(st.get("losses", 0)) + 1
+                        st["last_result"] = "LOSS"
+                    elif pnl > 0:
+                        rd = max(D(0), rd - pnl)
+                        st["wins"] = int(st.get("wins", 0)) + 1
+                        st["last_result"] = "WIN"
+                        if rd == 0:
+                            st["loss_streak"] = 0
+                            st["recovery_level"] = 0
+                    else:
+                        st["last_result"] = "FLAT"
+                    st["recovery_deficit"] = str(rd)
+                    st["position"] = None
+                    if int(st.get("loss_streak", 0)) >= MAX_RECOVERY_FAILURES:
+                        st["protect"] = True
+                        st["protect_anchor"] = str(dec(native_close["exit_price"]))
+                    st["last_update"] = now_iso()
+                    self.store.save()
+                    release_owner(self.store, self.symbol, self.id)
+                    logger.info("MACD NATIVE CLOSE | %s | reason=%s pnl=%s eq=%s RD=%s streak=%s protect=%s",
+                                self.id, native_close["reason"], pnl, eq, rd,
+                                st["loss_streak"], st["protect"])
+                    return
+            elif NATIVE_PROTECTIVE_ORDERS:
+                # Transparent migration/restart: recreate protection from the actual fill.
+                try:
+                    pos["native_bracket"] = self.exe.install_bracket(
+                        self.id, self.symbol, pos["leg"],
+                        dec(pos.get("tp_price")), dec(pos.get("stop_price")),
+                    )
+                    self.store.save()
+                except Exception as e:
+                    logger.exception("MACD BRACKET INSTALL FAIL | %s | %s", self.id, e)
+                    # Keep local bot-side TP/SL alive even if the exchange rejects the bracket.
             side = pos["side"]
             entry = dec(pos["leg"]["entry_price"])
             tp_price = dec(pos.get("tp_price"))
@@ -1921,7 +2442,8 @@ class Bot:
                     RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
                     MACD_TAKE_PROFIT_PCT, MACD_HARD_STOP_PCT)
         logger.info("NEWS 3-STAR=%s | janela=-%sm/+%sm | fail_closed=%s", NEWS_FILTER_ENABLED, NEWS_WINDOW_BEFORE_MIN, NEWS_WINDOW_AFTER_MIN, NEWS_FAIL_CLOSED)
-        logger.info("SAME_SYMBOL_MULTI_STRATEGY=%s (0 preserva contabilidade exata da posicao agregada Aster)", ALLOW_MULTI_STRATEGY_SAME_SYMBOL)
+        logger.info("SAME_SYMBOL_MULTI_STRATEGY=%s | NATIVE_PROTECTIVE_ORDERS=%s workingType=%s",
+                    ALLOW_MULTI_STRATEGY_SAME_SYMBOL, NATIVE_PROTECTIVE_ORDERS, PROTECTIVE_WORKING_TYPE)
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
@@ -2086,12 +2608,12 @@ class Bot:
         )
         logger.info(
             "HEALTH SNAPSHOT | version=%s live=%s api_v3=%s signer=%s | "
-            "mode=HEDGE margin=ISOLATED multi_strategy_same_symbol=%s | "
+            "mode=HEDGE margin=ISOLATED multi_strategy_same_symbol=%s native_protection=%s | "
             "news=%s source=%s events=%s age_s=%s fail_closed=%s window=-%sm/+%sm | "
             "range=VOLATILITY_ONLY trigger=%s tp=%s stop=%s | "
             "macd=%s tf=%s tp=%s stop=%s | recovery=%sx max_fail=%s",
             VERSION, LIVE_TRADING, "OK" if api_ok else "DEGRADED", SIGNER_ADDRESS,
-            ALLOW_MULTI_STRATEGY_SAME_SYMBOL,
+            ALLOW_MULTI_STRATEGY_SAME_SYMBOL, NATIVE_PROTECTIVE_ORDERS,
             news_health, news_source, news_events, news_age, NEWS_FAIL_CLOSED,
             NEWS_WINDOW_BEFORE_MIN, NEWS_WINDOW_AFTER_MIN,
             RANGE_TRIGGER_PCT, RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
