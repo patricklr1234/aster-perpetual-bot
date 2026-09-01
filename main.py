@@ -110,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.6.3-v7"
+VERSION = "2.6.4-v8"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -194,7 +194,7 @@ NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "1") == "1"
 NEWS_FAIL_CLOSED = os.getenv("NEWS_FAIL_CLOSED", "1") == "1"
 NEWS_WINDOW_BEFORE_MIN = int(os.getenv("NEWS_WINDOW_BEFORE_MIN", "15"))
 NEWS_WINDOW_AFTER_MIN = int(os.getenv("NEWS_WINDOW_AFTER_MIN", "15"))
-NEWS_REFRESH_SECONDS = int(os.getenv("NEWS_REFRESH_SECONDS", "10800"))
+NEWS_REFRESH_SECONDS = int(os.getenv("NEWS_REFRESH_SECONDS", "900"))
 NEWS_MAX_STALE_SECONDS = int(os.getenv("NEWS_MAX_STALE_SECONDS", "172800"))
 NEWS_LOOKAHEAD_DAYS = int(os.getenv("NEWS_LOOKAHEAD_DAYS", "7"))
 NEWS_MANUAL_EVENTS_UTC = os.getenv("NEWS_MANUAL_EVENTS_UTC", "").strip()
@@ -794,20 +794,62 @@ class NewsFilter:
             })
         logger.info("NEWS | cache atualizado | fonte=%s | eventos_high=%s", source, len(events))
 
+    def _parse_investing_rows(self, html_text: str) -> List[Dict[str, Any]]:
+        if BeautifulSoup is None:
+            raise RuntimeError("beautifulsoup4 ausente")
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        events: List[Dict[str, Any]] = []
+        now = datetime.now(UTC)
+        horizon = now + timedelta(days=NEWS_LOOKAHEAD_DAYS)
+        rows = soup.find_all("tr", attrs={"data-event-datetime": True})
+        for row in rows:
+            txt = " ".join(row.stripped_strings)
+            row_html = str(row)[:8000]
+            # Investing historicamente sinaliza impacto alto por bull3 / sentiment-3.
+            high = bool(re.search(r"bull3|High Volatility Expected|sentiment[-_ ]?3|importance[^>]*3", row_html, re.I))
+            if not high:
+                continue
+            raw_dt = row.get("data-event-datetime")
+            if not raw_dt:
+                continue
+            dt = self._parse_investing_dt(str(raw_dt))
+            if not dt or dt < now - timedelta(hours=2) or dt > horizon:
+                continue
+            event_cell = row.find("td", class_=lambda c: c and "event" in (c if isinstance(c, list) else str(c)).split())
+            title = " ".join(event_cell.stripped_strings)[:240] if event_cell else txt[:240]
+            events.append({"ts": dt.timestamp(), "title": title, "source": "INVESTING_3STAR"})
+        unique = {(round(float(e["ts"])), e["title"][:80]): e for e in events}
+        return sorted(unique.values(), key=lambda x: x["ts"])
+
     def _fetch_investing(self) -> List[Dict[str, Any]]:
         if BeautifulSoup is None:
             raise RuntimeError("beautifulsoup4 ausente")
-        # The visible calendar page is client-rendered and may contain no event rows.
-        # Its own calendar service returns the HTML fragment used by the page. Request
-        # GMT explicitly so data-event-datetime can be interpreted safely as UTC.
-        url = "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+
+        # V8: sessão real, aquecimento de cookies e retries. O endpoint de serviço
+        # do Investing pode devolver 403/429/5xx quando chamado sem sessão/cookies.
+        # Mantemos também leitura direta da página como segundo caminho INVESTING,
+        # antes de recorrer ao ForexFactory.
+        base = "https://www.investing.com"
+        calendar_url = base + "/economic-calendar/"
+        service_url = base + "/economic-calendar/Service/getCalendarFilteredData"
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+        common = {
+            "User-Agent": ua,
             "Accept-Language": "en-US,en;q=0.9",
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": "https://www.investing.com/economic-calendar/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Connection": "keep-alive",
         }
+        ajax = dict(common)
+        ajax.update({
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer": calendar_url,
+            "Origin": base,
+        })
+
         today = datetime.now(UTC).date()
         end = today + timedelta(days=NEWS_LOOKAHEAD_DAYS)
         form = [
@@ -819,37 +861,56 @@ class NewsFilter:
             ("dateFrom", today.isoformat()),
             ("dateTo", end.isoformat()),
         ]
-        r = requests.post(url, headers=headers, data=form, timeout=20)
-        r.raise_for_status()
-        payload = r.json()
-        if not isinstance(payload, dict) or "data" not in payload:
-            raise RuntimeError("resposta inesperada do calendario Investing")
-        soup = BeautifulSoup(str(payload.get("data", "")), "html.parser")
-        events: List[Dict[str, Any]] = []
-        horizon = datetime.now(UTC) + timedelta(days=NEWS_LOOKAHEAD_DAYS)
-        rows = soup.find_all("tr", attrs={"data-event-datetime": True})
-        for row in rows:
-            txt = " ".join(row.stripped_strings)
-            html = str(row)[:5000]
-            high = bool(re.search(r"bull3|High Volatility Expected|sentiment[-_ ]?3", html, re.I))
-            if not high:
-                continue
-            raw_dt = row.get("data-event-datetime")
-            if not raw_dt:
-                continue
-            dt = self._parse_investing_dt(raw_dt)
-            if not dt:
-                continue
-            if dt < datetime.now(UTC) - timedelta(hours=2) or dt > horizon:
-                continue
-            event_cell = row.find("td", class_=lambda c: c and "event" in (c if isinstance(c, list) else str(c)).split())
-            title = " ".join(event_cell.stripped_strings)[:240] if event_cell else txt[:240]
-            events.append({"ts": dt.timestamp(), "title": title, "source": "INVESTING_3STAR"})
-        # dedupe
-        unique = {}
-        for e in events:
-            unique[(round(float(e["ts"])), e["title"][:80])] = e
-        return sorted(unique.values(), key=lambda x: x["ts"])
+        errors: List[str] = []
+
+        with requests.Session() as sess:
+            sess.headers.update(common)
+            # 1) aquece sessão/cookies no próprio calendário.
+            try:
+                warm = sess.get(calendar_url, timeout=20, allow_redirects=True)
+                warm.raise_for_status()
+                direct_events = self._parse_investing_rows(warm.text)
+            except Exception as e:
+                direct_events = []
+                errors.append(f"warmup={type(e).__name__}:{e}")
+
+            # 2) serviço oficial usado pela própria página, com até 3 tentativas.
+            for attempt in range(1, 4):
+                try:
+                    r = sess.post(service_url, headers=ajax, data=form, timeout=25, allow_redirects=True)
+                    if r.status_code in (403, 429) or r.status_code >= 500:
+                        raise RuntimeError(f"HTTP {r.status_code}")
+                    r.raise_for_status()
+                    payload = r.json()
+                    if not isinstance(payload, dict) or "data" not in payload:
+                        raise RuntimeError("JSON sem campo data")
+                    events = self._parse_investing_rows(str(payload.get("data", "")))
+                    # Zero eventos pode ser legítimo; se a página direta já trouxe
+                    # eventos de alto impacto, preferimos não descartá-los.
+                    if events:
+                        logger.info("NEWS INVESTING | service OK | tentativa=%s | eventos_3star=%s", attempt, len(events))
+                        return events
+                    if direct_events:
+                        logger.info("NEWS INVESTING | service vazio, usando pagina direta | eventos_3star=%s", len(direct_events))
+                        return direct_events
+                    logger.info("NEWS INVESTING | service OK | nenhum evento 3-star no horizonte")
+                    return []
+                except Exception as e:
+                    errors.append(f"service#{attempt}={type(e).__name__}:{e}")
+                    if attempt < 3:
+                        time.sleep(1.5 * attempt)
+                        # Renova cookie antes da próxima tentativa.
+                        try:
+                            sess.get(calendar_url, timeout=15, allow_redirects=True)
+                        except Exception:
+                            pass
+
+            # 3) Ainda é Investing.com: usa a página HTML já recebida no warmup.
+            if direct_events:
+                logger.warning("NEWS INVESTING | service falhou, pagina direta OK | eventos_3star=%s", len(direct_events))
+                return direct_events
+
+        raise RuntimeError("Investing indisponivel apos retries: " + " | ".join(errors[-5:]))
 
     def _fetch_forexfactory(self) -> List[Dict[str, Any]]:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
