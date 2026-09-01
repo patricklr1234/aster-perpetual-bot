@@ -107,7 +107,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.5.0-v3"
+VERSION = "2.5.1-v3"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -910,6 +910,9 @@ def empty_macd_state(symbol: str, tf: str) -> Dict[str, Any]:
         "position": None,
         "recovery_deficit": "0",
         "loss_streak": 0,
+        # Persistent sizing level.  It must not be cleared while a recovery
+        # deficit still exists, including while/after the 3% protection.
+        "recovery_level": 0,
         "protect": False,
         "protect_anchor": None,
         "last_candle_close_ms": 0,
@@ -958,7 +961,33 @@ class StateStore:
             st["range"].setdefault(s, empty_range_state(s))
             st["symbol_owner"].setdefault(s, None)
             for tf in MACD_TIMEFRAMES:
-                st["macd"].setdefault(f"{s}:{tf}", empty_macd_state(s, tf))
+                key = f"{s}:{tf}"
+                st["macd"].setdefault(key, empty_macd_state(s, tf))
+                m = st["macd"][key]
+                rd = dec(m.get("recovery_deficit"))
+                streak = max(0, int(m.get("loss_streak", 0)))
+                saved_level = max(0, int(m.get("recovery_level", 0)))
+                if rd > 0:
+                    # V2.5.0 could leave RD>0 and streak=0 after protection
+                    # release.  Repair persisted /data/state.json safely: use
+                    # at least level 1, but never invent a level above what the
+                    # surviving state proves.
+                    repaired_level = min(
+                        MAX_RECOVERY_FAILURES,
+                        max(1, saved_level, streak),
+                    )
+                    if saved_level != repaired_level or streak == 0:
+                        logger.warning(
+                            "STATE MIGRATION | %s | RD=%s streak=%s recovery_level=%s->%s",
+                            key, rd, streak, saved_level, repaired_level,
+                        )
+                    m["recovery_level"] = repaired_level
+                    if streak == 0:
+                        m["loss_streak"] = repaired_level
+                else:
+                    m["recovery_level"] = 0
+                    if not m.get("protect"):
+                        m["loss_streak"] = 0
         st["version"] = VERSION
         return st
 
@@ -1654,6 +1683,10 @@ class MacdEngine:
         if pnl < 0:
             rd += -pnl
             st["loss_streak"] = int(st.get("loss_streak", 0)) + 1
+            st["recovery_level"] = min(
+                MAX_RECOVERY_FAILURES,
+                max(1, int(st.get("recovery_level", 0)) + 1),
+            )
             st["losses"] = int(st.get("losses", 0)) + 1
             st["last_result"] = "LOSS"
         elif pnl > 0:
@@ -1662,6 +1695,7 @@ class MacdEngine:
             st["last_result"] = "WIN"
             if rd == 0:
                 st["loss_streak"] = 0
+                st["recovery_level"] = 0
         else:
             st["last_result"] = "FLAT"
         st["recovery_deficit"] = str(rd)
@@ -1687,7 +1721,16 @@ class MacdEngine:
         target = rd * RECOVERY_MULTIPLIER if rd > 0 else None
         # MACD V2.3: TP real de 1% e stop real de 2%; o cruzamento oposto
         # continua sendo uma saida antecipada adicional.
-        recovery_level = min(int(st.get("loss_streak", 0)), MAX_RECOVERY_FAILURES) if rd > 0 else 0
+        # Hard invariant: an unpaid recovery deficit can never open as a fresh
+        # level-0 order.  This is independent from crossing direction.
+        recovery_level = (
+            min(
+                MAX_RECOVERY_FAILURES,
+                max(1, int(st.get("recovery_level", 0)), int(st.get("loss_streak", 0))),
+            )
+            if rd > 0 else 0
+        )
+        st["recovery_level"] = recovery_level
         sizing = self.account.sizing_for_profit_target(
             self.symbol, price, st, target, D("0.01"), D("0.02"), recovery_level=recovery_level
         )
@@ -1759,10 +1802,23 @@ class MacdEngine:
                 return
             # User requires 3% + aligned crossing. Current cross is the alignment.
             st["protect"] = False
-            st["loss_streak"] = 0
+            # Protection pauses entries; it does not forgive realized losses.
+            # Keep both counters until profits fully pay recovery_deficit.
+            if dec(st.get("recovery_deficit")) > 0:
+                st["recovery_level"] = min(
+                    MAX_RECOVERY_FAILURES,
+                    max(1, int(st.get("recovery_level", 0)), int(st.get("loss_streak", 0))),
+                )
+                st["loss_streak"] = max(1, int(st.get("loss_streak", 0)))
+            else:
+                st["recovery_level"] = 0
+                st["loss_streak"] = 0
             st["protect_anchor"] = None
             self.store.save()
-            logger.info("MACD PROTECT LIBERADO | %s | cross=%s", self.id, cross)
+            logger.info(
+                "MACD PROTECT LIBERADO | %s | cross=%s RD=%s recovery_level=%s",
+                self.id, cross, st.get("recovery_deficit"), st.get("recovery_level"),
+            )
 
         pos = st.get("position")
         if pos:
