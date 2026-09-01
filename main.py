@@ -110,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.6.4-v8"
+VERSION = "2.6.5-v9"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -1666,6 +1666,39 @@ class ExecutionEngine:
             except Exception as e:
                 logger.warning("CANCEL BASKET EXIT FAIL | %s | %s | %s", symbol, cid, e)
 
+    def basket_exit_is_live(self, symbol: str, native_exit: Optional[Dict[str, Any]]) -> bool:
+        """Confirma se TODAS as pernas esperadas de um basket exit continuam abertas na Aster.
+
+        V9: o estado persistido podia dizer que native_basket_stop existia mesmo depois de
+        a ordem ter sumido/cancelado na corretora. Isso impedia a reinstalação automática.
+        """
+        if not native_exit:
+            return False
+        if not LIVE_TRADING:
+            return True
+        expected = [str(x.get("client_id") or "") for x in native_exit.get("orders", []) if x.get("client_id")]
+        if not expected:
+            return False
+        try:
+            rows = self.client.open_orders(symbol)
+            if not isinstance(rows, list):
+                return False
+            live_cids = {
+                str(r.get("clientOrderId") or r.get("origClientOrderId") or "")
+                for r in rows
+                if str(r.get("status", "NEW")) in ("NEW", "PARTIALLY_FILLED")
+            }
+            missing = [cid for cid in expected if cid not in live_cids]
+            if missing:
+                logger.warning("NATIVE BASKET EXIT AUSENTE | %s | missing=%s | esperado=%s",
+                               symbol, missing, expected)
+                return False
+            return True
+        except Exception as e:
+            # Em falha transitória da consulta, não duplicar ordens por engano.
+            logger.warning("NATIVE BASKET EXIT VERIFY FAIL | %s | %s", symbol, e)
+            return True
+
     def consume_basket_exit(self, strategy_id: str, symbol: str, legs: List[Dict[str, Any]],
                             native_exit: Optional[Dict[str, Any]], ref_price: Decimal,
                             close_reason: str = "NATIVE_RANGE_BASKET_TAKE_PROFIT"
@@ -2047,7 +2080,7 @@ class RangeEngine:
         except Exception as e:
             b["native_basket_stop"] = None
             logger.exception("RANGE NATIVE BASKET SL FAIL | %s | %s", self.symbol, e)
-        logger.warning("RANGE RECOVERY PROTECTION | %s | TP=%s SL=%s | native_tp=%s native_sl=%s",
+        logger.warning("RANGE RECOVERY PROTECTION V9 | %s | TP=%s SL=%s | native_tp=%s native_sl=%s | hedge_children=2_por_alvo_quando_LONG_e_SHORT",
                        self.symbol, recovery_tp, recovery_stop,
                        bool(b.get("native_basket_exit")), bool(b.get("native_basket_stop")))
         st["last_update"] = now_iso()
@@ -2144,16 +2177,34 @@ class RangeEngine:
             else:
                 rtp = dec(b.get("recovery_tp_price"))
                 rsl = dec(b.get("recovery_stop_price"))
+
+                # V9: estado persistido não é prova de que a ordem ainda existe na corretora.
+                # Confirma TP e SL nativos contra /openOrders e reinstala o lado ausente.
+                if NATIVE_PROTECTIVE_ORDERS and b.get("native_basket_exit") and not self.exe.basket_exit_is_live(self.symbol, b.get("native_basket_exit")):
+                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+                    b["native_basket_exit"] = None
+                    self.store.save()
+                if NATIVE_PROTECTIVE_ORDERS and b.get("native_basket_stop") and not self.exe.basket_exit_is_live(self.symbol, b.get("native_basket_stop")):
+                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
+                    b["native_basket_stop"] = None
+                    self.store.save()
+
                 if rtp > 0 and not b.get("native_basket_exit") and NATIVE_PROTECTIVE_ORDERS:
                     try:
-                        b["native_basket_exit"] = self.exe.install_basket_exit(self.id + ":TP", self.symbol, b.get("legs", []), rtp, price)
+                        b["native_basket_exit"] = self.exe.install_basket_exit(
+                            self.id + ":TP", self.symbol, b.get("legs", []), rtp, price
+                        )
                         self.store.save()
+                        logger.warning("RANGE BASKET TP REINSTALADO | %s | trigger=%s", self.symbol, rtp)
                     except Exception as e:
                         logger.exception("RANGE BASKET TP REINSTALL FAIL | %s | %s", self.symbol, e)
                 if rsl > 0 and not b.get("native_basket_stop") and NATIVE_PROTECTIVE_ORDERS:
                     try:
-                        b["native_basket_stop"] = self.exe.install_basket_exit(self.id + ":SL", self.symbol, b.get("legs", []), rsl, price)
+                        b["native_basket_stop"] = self.exe.install_basket_exit(
+                            self.id + ":SL", self.symbol, b.get("legs", []), rsl, price
+                        )
                         self.store.save()
+                        logger.warning("RANGE BASKET SL REINSTALADO | %s | trigger=%s", self.symbol, rsl)
                     except Exception as e:
                         logger.exception("RANGE BASKET SL REINSTALL FAIL | %s | %s", self.symbol, e)
 
