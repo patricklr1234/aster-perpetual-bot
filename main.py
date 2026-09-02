@@ -110,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.6.9-v13"
+VERSION = "2.7.0-v14"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -1120,6 +1120,19 @@ class StateStore:
     def killed(self) -> str:
         with self.lock:
             return self.state.get("kill_switch", {}).get("mode", "OFF")
+
+    def clear_soft_position_mismatch(self) -> bool:
+        """Libera somente SOFT kill causado por POSITION_MISMATCH já reconciliado."""
+        with self.lock:
+            ks = self.state.get("kill_switch", {}) or {}
+            if str(ks.get("mode")) != "SOFT":
+                return False
+            if not str(ks.get("reason") or "").startswith("POSITION_MISMATCH"):
+                return False
+            self.state["kill_switch"] = {"mode": "OFF", "reason": None, "at": now_iso()}
+            self.save()
+        logger.warning("KILL SWITCH AUTO-CLEAR V14 | POSITION_MISMATCH reconciliado | novas entradas liberadas")
+        return True
 
 # -----------------------------------------------------------------------------
 # ACCOUNT / LEVERAGE / EXECUTION
@@ -2536,7 +2549,12 @@ class MacdEngine:
         blocked, why = self.news.blocked()
         if blocked:
             logger.info("MACD NEWS BLOCK | %s | %s", self.id, why); return
-        if self.store.killed() != "OFF": return
+        if self.store.killed() != "OFF":
+            logger.warning(
+                "MACD ENTRY BLOCKED BY KILL V14 | %s | mode=%s | side=%s | recovery_deficit=%s recovery_level=%s",
+                self.id, self.store.killed(), side, st.get("recovery_deficit"), st.get("recovery_level"),
+            )
+            return
         if not acquire_owner(self.store, self.symbol, self.id):
             logger.info("MACD OWNER BLOCK | %s | owner=%s", self.id, self.store.state["symbol_owner"].get(self.symbol)); return
         rd = dec(st.get("recovery_deficit"))
@@ -2759,9 +2777,13 @@ class Reconciler:
                 mismatches.append((k, e, a))
         if mismatches:
             reason = f"POSITION_MISMATCH expected_vs_actual={mismatches}"
-            self.store.kill("HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT", reason)
+            current_ks = self.store.state.get("kill_switch", {}) or {}
+            desired_mode = "HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
+            if str(current_ks.get("mode")) != desired_mode or str(current_ks.get("reason")) != reason:
+                self.store.kill(desired_mode, reason)
             return False
-        logger.info("RECONCILE | OK | positions=%s", actual)
+        cleared = self.store.clear_soft_position_mismatch()
+        logger.info("RECONCILE V14 | OK | positions=%s | soft_mismatch_cleared=%s", actual, cleared)
         return True
 
 # -----------------------------------------------------------------------------
@@ -2778,6 +2800,7 @@ class Bot:
         self.news = NewsFilter()
         self.account = AccountManager(self.client, self.rules, self.store)
         self.exe = ExecutionEngine(self.client, self.account, self.rules, self.store)
+        self._last_periodic_reconcile_ms = 0
         self.reconciler = Reconciler(self.client, self.store)
         self.range_engines: List[RangeEngine] = []
         self.macd_engines: List[MacdEngine] = []
@@ -2795,6 +2818,7 @@ class Bot:
                     INITIAL_BANKROLL_USD, INITIAL_OPERATION_NOTIONAL_USD,
                     BTC_INITIAL_BANKROLL_USD, BTC_INITIAL_OPERATION_NOTIONAL_USD,
                     RECOVERY_MULTIPLIER, MAX_RECOVERY_FAILURES)
+        logger.info("RECOVERY ENTRY MODEL V14 | MARTINGALE/RECOVERY=REATIVO_AO_SINAL; nao fica como ordem de entrada pendente na exchange")
         logger.info("EXITS | RANGE_TP=%s RANGE_STOP=%s | MACD_TP=%s MACD_STOP=%s | RANGE_RECOVERY=4X_MIN+DYNAMIC_NET",
                     RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
                     MACD_TAKE_PROFIT_PCT, MACD_HARD_STOP_PCT)
@@ -3204,6 +3228,18 @@ class Bot:
                     self.hard_kill()
                     self.store.kill("SOFT", "HARD_KILL_EXECUTED; manual review required")
                 prices = {s: self.md.get(s) for s in SYMBOLS}
+
+                # V14: após V13 limpar ghost legs, revalida o mismatch periodicamente.
+                # Quando físico e virtual voltarem a bater, libera SOMENTE o SOFT kill
+                # criado por POSITION_MISMATCH. Outros kills continuam intocados.
+                _now_reconcile = now_ms()
+                if _now_reconcile - self._last_periodic_reconcile_ms >= 15000:
+                    self._last_periodic_reconcile_ms = _now_reconcile
+                    try:
+                        self.reconciler.reconcile()
+                    except Exception as _re:
+                        logger.warning("PERIODIC RECONCILE FAIL V14 | %s", _re)
+
                 for e in self.range_engines:
                     p = prices.get(e.symbol)
                     if p and p > 0:
