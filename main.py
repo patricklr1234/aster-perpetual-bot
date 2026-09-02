@@ -77,6 +77,8 @@ import os
 import queue
 import re
 import signal
+import sqlite3
+import uuid
 import sys
 import threading
 import time
@@ -110,7 +112,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.7.0-v14"
+VERSION = "3.0.0-v15"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -127,6 +129,8 @@ STATE_FILE = BOT_DIR / "state.json"
 TRADES_FILE = BOT_DIR / "trades.jsonl"
 NEWS_CACHE_FILE = BOT_DIR / "news_calendar_cache.json"
 LOG_FILE = BOT_DIR / "aster_bot.log"
+LEDGER_FILE = BOT_DIR / "fill_ledger.sqlite3"
+ORDER_JOURNAL_FILE = BOT_DIR / "order_journal.jsonl"
 
 SYMBOLS = tuple(s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,HYPEUSDT").split(",") if s.strip())
 
@@ -195,13 +199,24 @@ NEWS_FAIL_CLOSED = os.getenv("NEWS_FAIL_CLOSED", "1") == "1"
 NEWS_WINDOW_BEFORE_MIN = int(os.getenv("NEWS_WINDOW_BEFORE_MIN", "15"))
 NEWS_WINDOW_AFTER_MIN = int(os.getenv("NEWS_WINDOW_AFTER_MIN", "15"))
 NEWS_REFRESH_SECONDS = int(os.getenv("NEWS_REFRESH_SECONDS", "900"))
-NEWS_MAX_STALE_SECONDS = int(os.getenv("NEWS_MAX_STALE_SECONDS", "172800"))
+NEWS_MAX_STALE_SECONDS = int(os.getenv("NEWS_MAX_STALE_SECONDS", "3600"))
 NEWS_LOOKAHEAD_DAYS = int(os.getenv("NEWS_LOOKAHEAD_DAYS", "7"))
 NEWS_MANUAL_EVENTS_UTC = os.getenv("NEWS_MANUAL_EVENTS_UTC", "").strip()
 
 # Kill switch
 KILL_SWITCH_ON_API_ERRORS = int(os.getenv("KILL_SWITCH_ON_API_ERRORS", "8"))
 HARD_KILL_ON_POSITION_MISMATCH = os.getenv("HARD_KILL_ON_POSITION_MISMATCH", "0") == "1"
+
+# V15 hard risk caps. Classic recovery remains 4x -> 16x, but dynamic sizing can never
+# exceed these explicit operator limits. Set per-symbol env vars to change them.
+MAX_RECOVERY_NOTIONAL_USD = D(os.getenv("MAX_RECOVERY_NOTIONAL_USD", "160"))
+BTC_MAX_RECOVERY_NOTIONAL_USD = D(os.getenv("BTC_MAX_RECOVERY_NOTIONAL_USD", "1600"))
+MAX_TOTAL_SYMBOL_NOTIONAL_USD = D(os.getenv("MAX_TOTAL_SYMBOL_NOTIONAL_USD", "300"))
+BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD = D(os.getenv("BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD", "2500"))
+MAX_PRICE_AGE_FOR_ENTRY_SECONDS = float(os.getenv("MAX_PRICE_AGE_FOR_ENTRY_SECONDS", "4"))
+RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "10"))
+LEDGER_RECONCILE_ON_STARTUP = os.getenv("LEDGER_RECONCILE_ON_STARTUP", "1") == "1"
+SELF_TEST_ON_STARTUP = os.getenv("SELF_TEST_ON_STARTUP", "1") == "1"
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -553,6 +568,15 @@ class AsterClient:
             p["startTime"] = start_ms
         return self._request("GET", "/fapi/v3/income", p, signed=True)
 
+    def user_trades(self, symbol: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None,
+                    limit: int = 1000) -> Any:
+        p: Dict[str, Any] = {"symbol": symbol, "limit": limit}
+        if start_ms is not None:
+            p["startTime"] = int(start_ms)
+        if end_ms is not None:
+            p["endTime"] = int(end_ms)
+        return self._request("GET", "/fapi/v3/userTrades", p, signed=True)
+
 # -----------------------------------------------------------------------------
 # EXCHANGE SYMBOL RULES
 # -----------------------------------------------------------------------------
@@ -651,6 +675,14 @@ class MarketData:
         self.rest_thread = threading.Thread(target=self._rest_loop, name="market-rest", daemon=True)
         self.rest_thread.start()
 
+    def age(self, symbol: str) -> float:
+        with self._lock:
+            ts = self.price_ts.get(symbol, 0)
+        return max(0.0, time.time() - ts) if ts else float("inf")
+
+    def is_fresh(self, symbol: str, max_age: float = MAX_PRICE_AGE_FOR_ENTRY_SECONDS) -> bool:
+        return self.age(symbol) <= max_age
+
     def get(self, symbol: str, max_age: float = 4.0) -> Optional[Decimal]:
         with self._lock:
             p = self.prices.get(symbol)
@@ -658,12 +690,15 @@ class MarketData:
         if p is not None and time.time() - ts <= max_age:
             return p
         try:
-            p = self.client.price(symbol)
-            self._set(symbol, p)
-            return p
+            fresh = self.client.price(symbol)
+            self._set(symbol, fresh)
+            return fresh
         except Exception as e:
-            logger.warning("PRICE FALLBACK FAIL | %s | %s", symbol, e)
-            return p
+            age = max(0.0, time.time() - ts) if ts else float("inf")
+            logger.warning("PRICE FALLBACK FAIL | %s | age_s=%.3f | %s", symbol, age, e)
+            # V15: never feed stale price into a NEW decision. Native exchange TP/SL
+            # remain live even when both websocket and REST are unavailable.
+            return None if age > max_age else p
 
     def _set(self, symbol: str, price: Decimal) -> None:
         if price <= 0:
@@ -993,6 +1028,14 @@ def configured_bankroll(symbol: str) -> Decimal:
 def configured_initial_notional(symbol: str) -> Decimal:
     return BTC_INITIAL_OPERATION_NOTIONAL_USD if symbol.upper() == "BTCUSDT" else INITIAL_OPERATION_NOTIONAL_USD
 
+
+def configured_max_recovery_notional(symbol: str) -> Decimal:
+    return BTC_MAX_RECOVERY_NOTIONAL_USD if symbol.upper() == "BTCUSDT" else MAX_RECOVERY_NOTIONAL_USD
+
+
+def configured_max_total_symbol_notional(symbol: str) -> Decimal:
+    return BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD if symbol.upper() == "BTCUSDT" else MAX_TOTAL_SYMBOL_NOTIONAL_USD
+
 def empty_range_state(symbol: str) -> Dict[str, Any]:
     bankroll = configured_bankroll(symbol)
     return {
@@ -1045,6 +1088,7 @@ def fresh_state() -> Dict[str, Any]:
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "kill_switch": {"mode": "OFF", "reason": None, "at": None},
+        "trade_gate": {"open_allowed": True, "reason": None, "at": now_iso()},
         "range": {s: empty_range_state(s) for s in SYMBOLS},
         "macd": {f"{s}:{tf}": empty_macd_state(s, tf) for s in SYMBOLS for tf in MACD_TIMEFRAMES},
         "symbol_owner": {s: None for s in SYMBOLS},
@@ -1067,6 +1111,7 @@ class StateStore:
             logger.info("STATE | novo")
         # Non-destructive migrations / add new configured symbols/timeframes.
         st.setdefault("kill_switch", {"mode": "OFF", "reason": None, "at": None})
+        st.setdefault("trade_gate", {"open_allowed": True, "reason": None, "at": now_iso()})
         st.setdefault("range", {})
         st.setdefault("macd", {})
         st.setdefault("symbol_owner", {})
@@ -1121,6 +1166,16 @@ class StateStore:
         with self.lock:
             return self.state.get("kill_switch", {}).get("mode", "OFF")
 
+    def set_trade_gate(self, allowed: bool, reason: Optional[str] = None) -> None:
+        with self.lock:
+            self.state["trade_gate"] = {"open_allowed": bool(allowed), "reason": reason, "at": now_iso()}
+            self.save()
+
+    def entry_allowed(self) -> Tuple[bool, Optional[str]]:
+        with self.lock:
+            g=self.state.get("trade_gate",{}) or {}
+            return bool(g.get("open_allowed", True)), g.get("reason")
+
     def clear_soft_position_mismatch(self) -> bool:
         """Libera somente SOFT kill causado por POSITION_MISMATCH já reconciliado."""
         with self.lock:
@@ -1131,8 +1186,197 @@ class StateStore:
                 return False
             self.state["kill_switch"] = {"mode": "OFF", "reason": None, "at": now_iso()}
             self.save()
-        logger.warning("KILL SWITCH AUTO-CLEAR V14 | POSITION_MISMATCH reconciliado | novas entradas liberadas")
+        logger.warning("KILL SWITCH AUTO-CLEAR V15 | POSITION_MISMATCH reconciliado | novas entradas liberadas")
         return True
+
+# -----------------------------------------------------------------------------
+# DURABLE FILL LEDGER + EXCHANGE SNAPSHOT + ORDER STATE MACHINE (V15)
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ExchangeSnapshot:
+    captured_ms: int
+    positions: Dict[Tuple[str, str], Decimal]
+    entry_prices: Dict[Tuple[str, str], Decimal]
+    open_orders: List[Dict[str, Any]]
+
+
+class FillLedger:
+    """Durable source of truth for per-strategy fills.
+
+    Aster aggregates physical positions by symbol+positionSide. The ledger keeps the
+    strategy attribution independently and survives Railway restarts. state.json remains
+    operational state (signals/baskets/protection), while this DB owns fill attribution.
+    """
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.RLock()
+        self.db = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS orders (
+            client_id TEXT PRIMARY KEY,
+            strategy_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            position_side TEXT NOT NULL,
+            action TEXT NOT NULL,
+            order_type TEXT NOT NULL,
+            requested_qty TEXT NOT NULL,
+            order_id TEXT,
+            status TEXT NOT NULL,
+            executed_qty TEXT NOT NULL DEFAULT '0',
+            avg_price TEXT NOT NULL DEFAULT '0',
+            commission TEXT NOT NULL DEFAULT '0',
+            realized_pnl TEXT NOT NULL DEFAULT '0',
+            reason TEXT,
+            created_ms INTEGER NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS lots (
+            leg_id TEXT PRIMARY KEY,
+            strategy_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            position_side TEXT NOT NULL,
+            opened_qty TEXT NOT NULL,
+            open_qty TEXT NOT NULL,
+            entry_price TEXT NOT NULL,
+            open_client_id TEXT,
+            opened_ms INTEGER NOT NULL,
+            closed_ms INTEGER,
+            source TEXT NOT NULL DEFAULT 'BOT'
+        );
+        CREATE INDEX IF NOT EXISTS idx_lots_open ON lots(symbol, position_side, open_qty);
+        CREATE INDEX IF NOT EXISTS idx_orders_oid ON orders(order_id);
+        """)
+        self.db.commit()
+
+    def close(self) -> None:
+        with self.lock:
+            self.db.commit(); self.db.close()
+
+    def reset(self) -> None:
+        with self.lock:
+            self.db.execute("DELETE FROM lots")
+            self.db.execute("DELETE FROM orders")
+            self.db.commit()
+        logger.warning("LEDGER RESET V15 | durable fill ledger cleared after confirmed emergency reset")
+
+    def order_state(self, client_id: str, strategy_id: str, symbol: str, position_side: str,
+                    action: str, order_type: str, requested_qty: Decimal, status: str,
+                    order_id: Any = None, executed_qty: Decimal = D(0), avg_price: Decimal = D(0),
+                    commission: Decimal = D(0), realized_pnl: Decimal = D(0), reason: str = "") -> None:
+        with self.lock:
+            t = now_ms()
+            self.db.execute("""
+                INSERT INTO orders(client_id,strategy_id,symbol,position_side,action,order_type,requested_qty,
+                    order_id,status,executed_qty,avg_price,commission,realized_pnl,reason,created_ms,updated_ms)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(client_id) DO UPDATE SET
+                    order_id=excluded.order_id,status=excluded.status,executed_qty=excluded.executed_qty,
+                    avg_price=excluded.avg_price,commission=excluded.commission,realized_pnl=excluded.realized_pnl,
+                    reason=excluded.reason,updated_ms=excluded.updated_ms
+            """, (client_id,strategy_id,symbol,position_side,action,order_type,str(requested_qty),
+                  str(order_id or ""),status,str(executed_qty),str(avg_price),str(commission),
+                  str(realized_pnl),reason,t,t))
+            self.db.commit()
+        jsonl_append(ORDER_JOURNAL_FILE, {"client_id":client_id,"strategy":strategy_id,"symbol":symbol,
+            "position_side":position_side,"action":action,"order_type":order_type,"status":status,
+            "executed_qty":str(executed_qty),"avg_price":str(avg_price),"commission":str(commission),
+            "realized_pnl":str(realized_pnl),"at":now_iso()})
+
+    def record_open_lot(self, leg_id: str, strategy_id: str, symbol: str, position_side: str,
+                        qty: Decimal, entry_price: Decimal, client_id: str, source: str = "BOT") -> None:
+        with self.lock:
+            self.db.execute("""
+                INSERT INTO lots(leg_id,strategy_id,symbol,position_side,opened_qty,open_qty,entry_price,
+                                 open_client_id,opened_ms,source)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(leg_id) DO UPDATE SET strategy_id=excluded.strategy_id,symbol=excluded.symbol,
+                    position_side=excluded.position_side,opened_qty=excluded.opened_qty,
+                    open_qty=CASE WHEN CAST(lots.open_qty AS REAL)>0 THEN lots.open_qty ELSE excluded.open_qty END,
+                    entry_price=excluded.entry_price,open_client_id=excluded.open_client_id,source=excluded.source
+            """, (leg_id,strategy_id,symbol,position_side,str(qty),str(qty),str(entry_price),client_id,now_ms(),source))
+            self.db.commit()
+
+    def record_close_lot(self, leg_id: str, qty: Decimal) -> None:
+        with self.lock:
+            row=self.db.execute("SELECT open_qty FROM lots WHERE leg_id=?",(leg_id,)).fetchone()
+            if not row: return
+            remaining=max(D(0),dec(row[0])-qty)
+            self.db.execute("UPDATE lots SET open_qty=?, closed_ms=? WHERE leg_id=?",
+                            (str(remaining), now_ms() if remaining<=0 else None, leg_id))
+            self.db.commit()
+
+    def open_by_symbol_side(self) -> Dict[Tuple[str,str], Decimal]:
+        out: Dict[Tuple[str,str], Decimal]={}
+        with self.lock:
+            rows=self.db.execute("SELECT symbol,position_side,open_qty FROM lots WHERE CAST(open_qty AS REAL)>0").fetchall()
+        for sym,side,q in rows:
+            k=(str(sym).upper(),str(side).upper()); out[k]=out.get(k,D(0))+dec(q)
+        return out
+
+    def open_strategy_qty(self, strategy_id: str, symbol: str, side: str) -> Decimal:
+        with self.lock:
+            row=self.db.execute("SELECT COALESCE(SUM(CAST(open_qty AS REAL)),0) FROM lots WHERE strategy_id=? AND symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
+                                (strategy_id,symbol,side)).fetchone()
+        return dec(row[0] if row else 0)
+
+    def bootstrap_from_state(self, store: 'StateStore') -> int:
+        """One-time migration for positions opened before V15. Never invents extra lots."""
+        with self.lock:
+            existing=self.db.execute("SELECT COUNT(*) FROM lots").fetchone()[0]
+        if existing:
+            return 0
+        seeded=0
+        with store.lock:
+            for sym,st in store.state.get("range",{}).items():
+                b=(st or {}).get("basket") or {}
+                for leg in b.get("legs",[]) or []:
+                    q=dec(leg.get("qty")); ep=dec(leg.get("entry_price")); lid=str(leg.get("id") or uuid.uuid4().hex)
+                    if q>0 and ep>0:
+                        self.record_open_lot(lid,f"RANGE:{sym}",sym,str(leg.get("side")),q,ep,lid,"STATE_BOOTSTRAP"); seeded+=1
+            for st in store.state.get("macd",{}).values():
+                pos=(st or {}).get("position") or {}; leg=pos.get("leg") or {}
+                q=dec(leg.get("qty")); ep=dec(leg.get("entry_price")); lid=str(leg.get("id") or uuid.uuid4().hex)
+                if q>0 and ep>0:
+                    self.record_open_lot(lid,str(st.get("strategy")),str(st.get("symbol")),str(leg.get("side")),q,ep,lid,"STATE_BOOTSTRAP"); seeded+=1
+        if seeded:
+            logger.warning("LEDGER BOOTSTRAP V15 | lots_seeded=%s from state.json",seeded)
+        return seeded
+
+
+class OrderManager:
+    """Central order state machine. Every exchange order is journaled before and after submit."""
+    TERMINAL={"FILLED","CANCELED","REJECTED","EXPIRED"}
+    def __init__(self, client: AsterClient, ledger: FillLedger):
+        self.client=client; self.ledger=ledger; self.lock=threading.RLock()
+
+    def submit_market(self, strategy_id: str, symbol: str, position_side: str, side: str,
+                      qty: Decimal, client_id: str, reason: str) -> Dict[str,Any]:
+        self.ledger.order_state(client_id,strategy_id,symbol,position_side,"OPEN" if side==("BUY" if position_side=="LONG" else "SELL") else "CLOSE",
+                                "MARKET",qty,"CREATED",reason=reason)
+        try:
+            resp=self.client.order(symbol,side,position_side,qty,client_id,"MARKET")
+            self.ledger.order_state(client_id,strategy_id,symbol,position_side,"MARKET","MARKET",qty,
+                                    str(resp.get("status") or "SUBMITTED"),resp.get("orderId"),dec(resp.get("executedQty")),dec(resp.get("avgPrice")),reason=reason)
+            return resp
+        except Exception:
+            self.ledger.order_state(client_id,strategy_id,symbol,position_side,"MARKET","MARKET",qty,"REJECTED",reason=reason)
+            raise
+
+    def submit_conditional(self, strategy_id: str, symbol: str, position_side: str, side: str,
+                           qty: Decimal, stop_price: Decimal, client_id: str, order_type: str,
+                           working_type: str, price_protect: bool, reason: str) -> Dict[str,Any]:
+        self.ledger.order_state(client_id,strategy_id,symbol,position_side,"PROTECT",order_type,qty,"CREATED",reason=reason)
+        try:
+            resp=self.client.conditional_order(symbol,side,position_side,qty,stop_price,client_id,order_type,working_type,price_protect)
+            self.ledger.order_state(client_id,strategy_id,symbol,position_side,"PROTECT",order_type,qty,
+                                    str(resp.get("status") or "SUBMITTED"),resp.get("orderId"),dec(resp.get("executedQty")),dec(resp.get("avgPrice")),reason=reason)
+            return resp
+        except Exception:
+            self.ledger.order_state(client_id,strategy_id,symbol,position_side,"PROTECT",order_type,qty,"REJECTED",reason=reason)
+            raise
 
 # -----------------------------------------------------------------------------
 # ACCOUNT / LEVERAGE / EXECUTION
@@ -1249,6 +1493,19 @@ class AccountManager:
                      "mmr": str(mmr), "protected_move": str(protected_move),
                      "liq_safe_max": liq_safe, "denom": str(denom)}
 
+    def current_symbol_notional(self, symbol: str) -> Decimal:
+        if not LIVE_TRADING:
+            return D(0)
+        total=D(0)
+        try:
+            for p in self.client.positions(symbol):
+                q=abs(dec(p.get("positionAmt"))); mark=dec(p.get("markPrice") or p.get("entryPrice"))
+                if q>0 and mark>0:
+                    total += q*mark
+        except Exception as e:
+            logger.warning("SYMBOL NOTIONAL SNAPSHOT FAIL | %s | %s",symbol,e)
+        return total
+
     def base_margin_budget(self, strategy_state: Dict[str, Any]) -> Decimal:
         eq = dec(strategy_state.get("equity"), str(INITIAL_BANKROLL_USD))
         # Recovery margin may use the individual logical cash, within the configured cap.
@@ -1302,6 +1559,11 @@ class AccountManager:
             classic_notional = base_notional * (RECOVERY_MULTIPLIER ** recovery_level)
             desired_notional = max(classic_notional, dec(desired_notional_override)) \
                 if desired_notional_override is not None else classic_notional
+            recovery_cap = configured_max_recovery_notional(symbol)
+            if desired_notional > recovery_cap:
+                logger.warning("RECOVERY CAP V15 | %s | requested=%s capped=%s level=%s",
+                               symbol, desired_notional, recovery_cap, recovery_level)
+                desired_notional = recovery_cap
             cap, meta = self.safe_leverage_cap(symbol, desired_notional, adverse_distance_pct)
             # Use the highest safe leverage. Isolated collateral may temporarily exceed
             # logical equity because collateral is returned on close; risk to the stop
@@ -1316,6 +1578,12 @@ class AccountManager:
         qty = self.rules.qty(symbol, notional / price, price)
         actual_notional = qty * price
         actual_margin = actual_notional / D(lev)
+        current_symbol_notional = self.current_symbol_notional(symbol)
+        symbol_cap = configured_max_total_symbol_notional(symbol)
+        if current_symbol_notional + actual_notional > symbol_cap:
+            logger.warning("SYMBOL EXPOSURE CAP V15 | %s | current=%s new=%s cap=%s",
+                           symbol, current_symbol_notional, actual_notional, symbol_cap)
+            return None
         estimated_adverse_loss = actual_notional * adverse_distance_pct
         if fresh_operation:
             max_allowed = desired_notional * (D(1) + MAX_INITIAL_NOTIONAL_OVERSHOOT_PCT)
@@ -1365,11 +1633,14 @@ class AccountManager:
 class ExecutionEngine:
     PREFIX = "a3"
 
-    def __init__(self, client: AsterClient, account: AccountManager, rules: RulesBook, store: StateStore):
+    def __init__(self, client: AsterClient, account: AccountManager, rules: RulesBook, store: StateStore,
+                 ledger: FillLedger):
         self.client = client
         self.account = account
         self.rules = rules
         self.store = store
+        self.ledger = ledger
+        self.orders = OrderManager(client, ledger)
         self.seq = 0
         self.lock = threading.RLock()
 
@@ -1411,6 +1682,20 @@ class ExecutionEngine:
             logger.warning("FILL AVG AUSENTE | %s | cid=%s | usando ref_price=%s", symbol, client_id, fallback_price)
         return qty, avg
 
+    def _actual_trade_costs(self, symbol: str, order_id: Any, around_ms: int) -> Tuple[Decimal, Decimal]:
+        """Returns (commission_abs, realized_pnl) from Aster /fapi/v3/userTrades when available."""
+        if not LIVE_TRADING or not order_id:
+            return D(0), D(0)
+        try:
+            rows=self.client.user_trades(symbol,max(0,around_ms-120000),around_ms+120000,1000)
+            matched=[x for x in (rows if isinstance(rows,list) else []) if str(x.get("orderId"))==str(order_id)]
+            commission=sum((abs(dec(x.get("commission"))) for x in matched),D(0))
+            realized=sum((dec(x.get("realizedPnl")) for x in matched),D(0))
+            return commission, realized
+        except Exception as e:
+            logger.warning("ACTUAL FEE/P&L LOOKUP FAIL | %s order_id=%s | %s",symbol,order_id,e)
+            return D(0), D(0)
+
     def market(self, strategy_id: str, symbol: str, position_side: str, qty: Decimal,
                opening: bool, ref_price: Decimal) -> Dict[str, Any]:
         with self.lock:
@@ -1422,12 +1707,23 @@ class ExecutionEngine:
                 return {"qty": qty, "price": ref_price, "client_id": cid,
                         "order_id": f"SIM-{cid}", "status": "FILLED", "time": now_ms(),
                         "price_source": "SIM_REF"}
-            resp = self.client.order(symbol, side, position_side, qty, cid, "MARKET")
+            submitted_ms=now_ms()
+            resp = self.orders.submit_market(strategy_id, symbol, position_side, side, qty, cid,
+                                             "OPEN" if opening else "CLOSE")
             filled, avg = self._fill_from_response(symbol, resp, cid, ref_price)
-            logger.info("ORDER FILLED | %s | %s %s posSide=%s requested_qty=%s filled_qty=%s avg=%s cid=%s",
-                        strategy_id, "OPEN" if opening else "CLOSE", side, position_side, qty, filled, avg, cid)
-            return {"qty": filled, "price": avg, "client_id": cid, "order_id": resp.get("orderId"),
-                    "status": resp.get("status"), "time": now_ms(), "price_source": "EXCHANGE_AVG"}
+            # query_order may contain the final orderId even if submit response was incomplete
+            order_id=resp.get("orderId")
+            if not order_id:
+                try: order_id=self.client.query_order(symbol,cid).get("orderId")
+                except Exception: pass
+            commission, realized=self._actual_trade_costs(symbol,order_id,now_ms())
+            self.ledger.order_state(cid,strategy_id,symbol,position_side,"OPEN" if opening else "CLOSE","MARKET",qty,
+                                    "FILLED",order_id,filled,avg,commission,realized,"MARKET_EXECUTION")
+            logger.info("ORDER FILLED V15 | %s | %s %s posSide=%s requested_qty=%s filled_qty=%s avg=%s commission=%s realized=%s cid=%s",
+                        strategy_id, "OPEN" if opening else "CLOSE", side, position_side, qty, filled, avg, commission, realized, cid)
+            return {"qty": filled, "price": avg, "client_id": cid, "order_id": order_id,
+                    "status": "FILLED", "time": submitted_ms, "price_source": "EXCHANGE_AVG",
+                    "commission_actual": commission, "realized_pnl_exchange": realized}
 
     def open_leg(self, strategy_id: str, symbol: str, position_side: str, sizing: Dict[str, Any],
                  reason: str) -> Dict[str, Any]:
@@ -1446,6 +1742,7 @@ class ExecutionEngine:
             "opened_at": now_iso(),
             "reason": reason,
         }
+        self.ledger.record_open_lot(leg["id"], strategy_id, symbol, position_side, fill["qty"], fill["price"], fill["client_id"])
         jsonl_append(TRADES_FILE, {"event": "OPEN", "strategy": strategy_id, "symbol": symbol,
                                   "leg": leg, "at": now_iso()})
         return leg
@@ -1456,15 +1753,50 @@ class ExecutionEngine:
         entry = dec(leg["entry_price"])
         gross = (exitp - entry) * closed_qty if leg["side"] == "LONG" else (entry - exitp) * closed_qty
         fee_rate = D(os.getenv("TAKER_FEE_RATE", "0.00035"))
-        fees_est = (entry * closed_qty + exitp * closed_qty) * fee_rate
-        pnl = gross - fees_est
+        entry_fee_est = entry * closed_qty * fee_rate
+        exit_fee_est = exitp * closed_qty * fee_rate
+        fees_est = entry_fee_est + exit_fee_est
+        entry_commission_actual=D(0); exit_commission_actual=D(0); exchange_realized=D(0)
+        if LIVE_TRADING:
+            try:
+                # Exact entry fee belongs to the opening order for this virtual leg.
+                open_row=self.ledger.db.execute("SELECT commission FROM orders WHERE client_id=?",(str(leg.get("id")),)).fetchone()
+                if open_row:
+                    full_open_fee=dec(open_row[0])
+                    opened_qty=max(dec(leg.get("qty")),closed_qty)
+                    if full_open_fee>0 and opened_qty>0:
+                        entry_commission_actual=full_open_fee*(closed_qty/opened_qty)
+
+                row=self.ledger.db.execute("SELECT order_id,commission,realized_pnl FROM orders WHERE client_id=?",(close_client_id,)).fetchone()
+                order_id=row[0] if row and row[0] else None
+                if row:
+                    exit_commission_actual=dec(row[1]); exchange_realized=dec(row[2])
+                if exit_commission_actual <= 0:
+                    if not order_id:
+                        try: order_id=self.client.query_order(symbol,close_client_id).get("orderId")
+                        except Exception: order_id=None
+                    if order_id:
+                        exit_commission_actual, exchange_realized=self._actual_trade_costs(symbol,order_id,now_ms())
+                        self.ledger.order_state(close_client_id,strategy_id,symbol,str(leg.get("side")),"CLOSE","EXCHANGE_FILL",closed_qty,
+                                                "FILLED",order_id,closed_qty,exitp,exit_commission_actual,exchange_realized,reason)
+            except Exception as e:
+                logger.warning("CLOSE ACTUAL COST RECONCILE FAIL | %s | %s",close_client_id,e)
+        entry_fee_used = entry_commission_actual if entry_commission_actual > 0 else entry_fee_est
+        exit_fee_used = exit_commission_actual if exit_commission_actual > 0 else exit_fee_est
+        fees_actual = entry_commission_actual + exit_commission_actual
+        fees_used = entry_fee_used + exit_fee_used
+        pnl = gross - fees_used
         rec = {
             "leg_id": leg["id"], "side": leg["side"], "qty": str(closed_qty),
             "entry_price": str(entry), "exit_price": str(exitp), "gross": str(gross),
-            "fees_est": str(fees_est), "pnl_est": str(pnl), "reason": reason,
+            "fees_est": str(fees_est), "entry_fee_actual": str(entry_commission_actual),
+            "exit_fee_actual": str(exit_commission_actual), "fees_actual": str(fees_actual),
+            "fees_used": str(fees_used), "exchange_realized_pnl": str(exchange_realized),
+            "pnl_est": str(pnl), "reason": reason,
             "closed_at": now_iso(), "close_client_id": close_client_id,
             "exit_source": exit_source,
         }
+        self.ledger.record_close_lot(str(leg.get("id")), closed_qty)
         jsonl_append(TRADES_FILE, {"event": "CLOSE", "strategy": strategy_id, "symbol": symbol,
                                   "close": rec, "at": now_iso()})
         return rec
@@ -1496,7 +1828,7 @@ class ExecutionEngine:
             qty = floor_step(qty, step)
             if qty <= 0:
                 logger.warning(
-                    "CLOSE LEG SKIP V13 | %s | %s %s | wanted=%s physical_available=%s | "
+                    "CLOSE LEG SKIP V15 | %s | %s %s | wanted=%s physical_available=%s | "
                     "motivo=POSICAO_FISICA_JA_ENCERRADA_OU_RESERVADA_PARA_OUTRA_ESTRATEGIA",
                     strategy_id, symbol, leg.get("side"), wanted, physical,
                 )
@@ -1547,14 +1879,14 @@ class ExecutionEngine:
                 "working_type": PROTECTIVE_WORKING_TYPE,
                 "installed_at": now_iso(),
             }
-        tp_resp = self.client.conditional_order(
-            symbol, close_side, side, qty, tp, tp_cid, "TAKE_PROFIT_MARKET",
-            PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT,
+        tp_resp = self.orders.submit_conditional(
+            strategy_id, symbol, side, close_side, qty, tp, tp_cid, "TAKE_PROFIT_MARKET",
+            PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT, "TAKE_PROFIT",
         )
         try:
-            sl_resp = self.client.conditional_order(
-                symbol, close_side, side, qty, sl, sl_cid, "STOP_MARKET",
-                PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT,
+            sl_resp = self.orders.submit_conditional(
+                strategy_id, symbol, side, close_side, qty, sl, sl_cid, "STOP_MARKET",
+                PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT, "STOP_LOSS",
             )
         except Exception:
             try:
@@ -1671,9 +2003,9 @@ class ExecutionEngine:
                 if not LIVE_TRADING:
                     resp = {"orderId": f"SIM-{cid}", "status": "NEW"}
                 else:
-                    resp = self.client.conditional_order(
-                        symbol, close_side, position_side, qty, trigger, cid, order_type,
-                        PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT,
+                    resp = self.orders.submit_conditional(
+                        strategy_id, symbol, position_side, close_side, qty, trigger, cid, order_type,
+                        PROTECTIVE_WORKING_TYPE, PROTECTIVE_PRICE_PROTECT, "BASKET_EXIT",
                     )
                     placed.append(cid)
                 orders.append({
@@ -1941,7 +2273,7 @@ class RangeEngine:
             if keep <= 0:
                 changed = True
                 logger.warning(
-                    "RANGE GHOST LEG REMOVIDA V13 | %s | side=%s leg=%s virtual_qty=%s "
+                    "RANGE GHOST LEG REMOVIDA V15 | %s | side=%s leg=%s virtual_qty=%s "
                     "physical_capacity=%s reserved_other=%s",
                     self.symbol, side, leg.get("id"), qty, by_side_capacity[side],
                     self._other_strategy_reserved_qty(side),
@@ -1954,7 +2286,7 @@ class RangeEngine:
                 new_leg["notional"] = str(keep * dec(new_leg.get("entry_price")))
                 leg = new_leg
                 logger.warning(
-                    "RANGE GHOST LEG REDUZIDA V13 | %s | side=%s leg=%s old_qty=%s new_qty=%s",
+                    "RANGE GHOST LEG REDUZIDA V15 | %s | side=%s leg=%s old_qty=%s new_qty=%s",
                     self.symbol, side, leg.get("id"), qty, keep,
                 )
             rebuilt.append(leg)
@@ -1983,7 +2315,7 @@ class RangeEngine:
             self.store.save()
             release_owner(self.store, self.symbol, self.id)
             logger.warning(
-                "RANGE BASKET RECONCILIADO V13 | %s | nenhuma quantidade RANGE restante na Aster | "
+                "RANGE BASKET RECONCILIADO V15 | %s | nenhuma quantidade RANGE restante na Aster | "
                 "status=%s equity_preservada=%s RD_preservado=%s",
                 self.symbol, st["status"], st.get("equity"), st.get("recovery_deficit"),
             )
@@ -2059,7 +2391,12 @@ class RangeEngine:
             raise RuntimeError("RANGE recovery sem rendimento liquido positivo no TP")
         dynamic_notional = max(D(0), (desired_basket_profit - existing_at_tp) / net_yield)
         classic_floor = base_notional * (RECOVERY_MULTIPLIER ** recovery_level)
-        return max(dynamic_notional, classic_floor), tp_price, existing_at_tp
+        requested = max(dynamic_notional, classic_floor)
+        capped = min(requested, configured_max_recovery_notional(self.symbol))
+        if capped < requested:
+            logger.warning("RANGE DYNAMIC RECOVERY CAPPED V15 | %s | requested=%s cap=%s level=%s",
+                           self.symbol, requested, capped, recovery_level)
+        return capped, tp_price, existing_at_tp
 
     def _open(self, side: str, price: Decimal, target_profit: Optional[Decimal], reason: str,
               recovery_level: int = 0,
@@ -2070,6 +2407,13 @@ class RangeEngine:
             logger.info("RANGE BLOQUEADO NEWS | %s | %s", self.symbol, why)
             return None
         if self.store.killed() != "OFF":
+            return None
+        gate_ok, gate_reason = self.store.entry_allowed()
+        if not gate_ok:
+            logger.warning("RANGE ENTRY GATE V15 | %s | %s", self.symbol, gate_reason)
+            return None
+        if not self.md.is_fresh(self.symbol):
+            logger.warning("RANGE ENTRY STALE PRICE V15 | %s | age_s=%.3f", self.symbol, self.md.age(self.symbol))
             return None
         if not acquire_owner(self.store, self.symbol, self.id):
             logger.info("RANGE BLOQUEADO OWNER | %s | owner=%s", self.symbol, self.store.state["symbol_owner"].get(self.symbol))
@@ -2251,7 +2595,7 @@ class RangeEngine:
         except Exception as e:
             b["native_basket_stop"] = None
             logger.exception("RANGE NATIVE BASKET SL FAIL | %s | %s", self.symbol, e)
-        logger.warning("RANGE RECOVERY PROTECTION V9 | %s | TP=%s SL=%s | native_tp=%s native_sl=%s | hedge_children=2_por_alvo_quando_LONG_e_SHORT",
+        logger.warning("RANGE RECOVERY PROTECTION V15 | %s | TP=%s SL=%s | native_tp=%s native_sl=%s | hedge_children=2_por_alvo_quando_LONG_e_SHORT",
                        self.symbol, recovery_tp, recovery_stop,
                        bool(b.get("native_basket_exit")), bool(b.get("native_basket_stop")))
         st["last_update"] = now_iso()
@@ -2372,7 +2716,7 @@ class RangeEngine:
                         tol = max(tick * D(2), _re * D("0.000001"))
                         if abs(stored_rtp - expected_rtp) > tol or abs(stored_rsl - expected_rsl) > tol:
                             logger.warning(
-                                "RANGE RECOVERY PRICE MIGRATION V13 | %s | side=%s entry=%s | "
+                                "RANGE RECOVERY PRICE MIGRATION V15 | %s | side=%s entry=%s | "
                                 "old_tp=%s old_sl=%s -> new_tp=%s new_sl=%s",
                                 self.symbol, active_recovery_side, _re,
                                 stored_rtp, stored_rsl, expected_rtp, expected_rsl,
@@ -2407,7 +2751,7 @@ class RangeEngine:
                     st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0); st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
                     st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"; st["basket"] = None; st["failures"] = 0; st["status"] = "IDLE"
                     st["anchor"] = str(price); st["protect_anchor"] = None; st["last_update"] = now_iso(); self.store.save(); release_owner(self.store, self.symbol, self.id)
-                    logger.info("RANGE NATIVE BASKET TP CLOSE V13 | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
+                    logger.info("RANGE NATIVE BASKET TP CLOSE V15 | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
                     return
 
                 native_stop = None
@@ -2426,7 +2770,7 @@ class RangeEngine:
                     st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0); st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
                     st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"; st["basket"] = None; st["status"] = "PROTECT"
                     st["protect_anchor"] = str(price); st["anchor"] = str(price); st["last_update"] = now_iso(); self.store.save(); release_owner(self.store, self.symbol, self.id)
-                    logger.warning("RANGE NATIVE BASKET SL CLOSE V13 | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
+                    logger.warning("RANGE NATIVE BASKET SL CLOSE V15 | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
                     return
 
                 # Se uma versão anterior perdeu o ID do fill, reconcilia o state com
@@ -2456,7 +2800,7 @@ class RangeEngine:
                             self.id + ":TP", self.symbol, b.get("legs", []), rtp, price
                         )
                         self.store.save()
-                        logger.warning("RANGE BASKET TP REINSTALADO V13 | %s | trigger=%s", self.symbol, rtp)
+                        logger.warning("RANGE BASKET TP REINSTALADO V15 | %s | trigger=%s", self.symbol, rtp)
                     except Exception as e:
                         logger.exception("RANGE BASKET TP REINSTALL FAIL | %s | %s", self.symbol, e)
                 if rsl > 0 and not b.get("native_basket_stop") and NATIVE_PROTECTIVE_ORDERS:
@@ -2465,7 +2809,7 @@ class RangeEngine:
                             self.id + ":SL", self.symbol, b.get("legs", []), rsl, price
                         )
                         self.store.save()
-                        logger.warning("RANGE BASKET SL REINSTALADO V13 | %s | trigger=%s", self.symbol, rsl)
+                        logger.warning("RANGE BASKET SL REINSTALADO V15 | %s | trigger=%s", self.symbol, rsl)
                     except Exception as e:
                         logger.exception("RANGE BASKET SL REINSTALL FAIL | %s | %s", self.symbol, e)
 
@@ -2551,9 +2895,16 @@ class MacdEngine:
             logger.info("MACD NEWS BLOCK | %s | %s", self.id, why); return
         if self.store.killed() != "OFF":
             logger.warning(
-                "MACD ENTRY BLOCKED BY KILL V14 | %s | mode=%s | side=%s | recovery_deficit=%s recovery_level=%s",
+                "MACD ENTRY BLOCKED BY KILL V15 | %s | mode=%s | side=%s | recovery_deficit=%s recovery_level=%s",
                 self.id, self.store.killed(), side, st.get("recovery_deficit"), st.get("recovery_level"),
             )
+            return
+        gate_ok, gate_reason = self.store.entry_allowed()
+        if not gate_ok:
+            logger.warning("MACD ENTRY GATE V15 | %s | %s", self.id, gate_reason)
+            return
+        if not self.md.is_fresh(self.symbol):
+            logger.warning("MACD ENTRY STALE PRICE V15 | %s | age_s=%.3f", self.id, self.md.age(self.symbol))
             return
         if not acquire_owner(self.store, self.symbol, self.id):
             logger.info("MACD OWNER BLOCK | %s | owner=%s", self.id, self.store.state["symbol_owner"].get(self.symbol)); return
@@ -2734,57 +3085,69 @@ class MacdEngine:
 # -----------------------------------------------------------------------------
 
 class Reconciler:
-    def __init__(self, client: AsterClient, store: StateStore):
-        self.client = client; self.store = store
+    def __init__(self, client: AsterClient, store: StateStore, ledger: FillLedger, rules: RulesBook):
+        self.client=client; self.store=store; self.ledger=ledger; self.rules=rules
+        self.last_snapshot: Optional[ExchangeSnapshot]=None
 
-    def expected_by_symbol_side(self) -> Dict[Tuple[str, str], Decimal]:
-        out: Dict[Tuple[str, str], Decimal] = {}
-        with self.store.lock:
-            for sym, st in self.store.state["range"].items():
-                b = st.get("basket")
-                if b:
-                    for leg in b.get("legs", []):
-                        key = (sym, leg["side"])
-                        out[key] = out.get(key, D(0)) + dec(leg["qty"])
-            for key, st in self.store.state["macd"].items():
-                pos = st.get("position")
-                if pos:
-                    leg = pos["leg"]
-                    k = (st["symbol"], leg["side"])
-                    out[k] = out.get(k, D(0)) + dec(leg["qty"])
-        return out
+    def snapshot(self) -> ExchangeSnapshot:
+        positions: Dict[Tuple[str,str],Decimal]={}; entries: Dict[Tuple[str,str],Decimal]={}
+        for p in (self.client.positions() if LIVE_TRADING else []):
+            sym=str(p.get("symbol","")).upper(); side=str(p.get("positionSide","")).upper()
+            if sym not in SYMBOLS or side not in ("LONG","SHORT"): continue
+            q=abs(dec(p.get("positionAmt")))
+            if q>0:
+                positions[(sym,side)]=q; entries[(sym,side)]=dec(p.get("entryPrice"))
+        orders=self.client.open_orders() if LIVE_TRADING else []
+        snap=ExchangeSnapshot(now_ms(),positions,entries,orders if isinstance(orders,list) else [])
+        self.last_snapshot=snap
+        return snap
+
+    def expected_by_symbol_side(self) -> Dict[Tuple[str,str],Decimal]:
+        return self.ledger.open_by_symbol_side()
 
     def reconcile(self) -> bool:
         if not LIVE_TRADING:
-            return True
-        expected = self.expected_by_symbol_side()
-        actual: Dict[Tuple[str, str], Decimal] = {}
-        pos = self.client.positions()
-        for p in pos:
-            sym = str(p.get("symbol", "")).upper(); ps = str(p.get("positionSide", ""))
-            if sym not in SYMBOLS or ps not in ("LONG", "SHORT"):
-                continue
-            q = abs(dec(p.get("positionAmt")))
-            if q > 0:
-                actual[(sym, ps)] = q
-        mismatches = []
-        keys = set(expected) | set(actual)
-        for k in keys:
-            e = expected.get(k, D(0)); a = actual.get(k, D(0))
-            # tolerate one minimal step.
-            tol = D("0.00000001")
-            if abs(e - a) > tol:
-                mismatches.append((k, e, a))
+            self.store.set_trade_gate(True,None); return True
+        expected=self.expected_by_symbol_side(); snap=self.snapshot(); actual=snap.positions
+        mismatches=[]
+        for k in set(expected)|set(actual):
+            e=expected.get(k,D(0)); a=actual.get(k,D(0))
+            step=self.rules.rules[k[0]].step_size if k[0] in self.rules.rules else D("0.00000001")
+            if abs(e-a) >= step:
+                mismatches.append((k,e,a))
         if mismatches:
-            reason = f"POSITION_MISMATCH expected_vs_actual={mismatches}"
-            current_ks = self.store.state.get("kill_switch", {}) or {}
-            desired_mode = "HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
-            if str(current_ks.get("mode")) != desired_mode or str(current_ks.get("reason")) != reason:
-                self.store.kill(desired_mode, reason)
+            reason=f"POSITION_MISMATCH_LEDGER expected_vs_actual={mismatches}"
+            self.store.set_trade_gate(False,reason)
+            current_ks=self.store.state.get("kill_switch",{}) or {}; desired="HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
+            if str(current_ks.get("mode"))!=desired or str(current_ks.get("reason"))!=reason:
+                self.store.kill(desired,reason)
+            logger.error("RECONCILE V15 | BLOQUEADO | %s",reason)
             return False
-        cleared = self.store.clear_soft_position_mismatch()
-        logger.info("RECONCILE V14 | OK | positions=%s | soft_mismatch_cleared=%s", actual, cleared)
+        self.store.set_trade_gate(True,None)
+        cleared=self.store.clear_soft_position_mismatch()
+        logger.info("RECONCILE V15 | OK | ledger=%s physical=%s | soft_mismatch_cleared=%s",expected,actual,cleared)
         return True
+
+# -----------------------------------------------------------------------------
+# BUILT-IN REGRESSION CHECKS (pure logic, no exchange orders)
+# -----------------------------------------------------------------------------
+
+def run_internal_regression_checks() -> None:
+    """Fast invariants that must pass before live startup."""
+    assert RANGE_SIGNAL_MODE == "VOLATILITY_ONLY"
+    assert RANGE_TRIGGER_PCT > 0 and RANGE_TAKE_PROFIT_PCT > 0 and RANGE_HARD_STOP_PCT > 0
+    assert MACD_FAST < MACD_SLOW and MACD_SIGNAL > 0
+    assert RECOVERY_MULTIPLIER >= D(1) and MAX_RECOVERY_FAILURES >= 0
+    assert configured_max_recovery_notional("BTCUSDT") >= configured_initial_notional("BTCUSDT")
+    assert configured_max_recovery_notional("ETHUSDT") >= configured_initial_notional("ETHUSDT")
+    # Tick rounding must never move stop/TP toward unsafe side.
+    fake=object.__new__(RulesBook); fake.rules={"X":SymbolRules("X",D("0.1"),D("0.001"),D("0.001"),D("100"),D("5"))}
+    assert fake.trigger_price("X",D("100.01"),"UP") == D("100.1")
+    assert fake.trigger_price("X",D("100.09"),"DOWN") == D("100.0")
+    # 4x/16x classic invariant.
+    assert RECOVERY_MULTIPLIER ** 1 == RECOVERY_MULTIPLIER
+    assert RECOVERY_MULTIPLIER ** 2 == RECOVERY_MULTIPLIER * RECOVERY_MULTIPLIER
+    logger.info("SELF TEST V15 | PASS | range/macd/recovery/risk/tick invariants")
 
 # -----------------------------------------------------------------------------
 # BOT
@@ -2799,9 +3162,10 @@ class Bot:
         self.md = MarketData(self.client)
         self.news = NewsFilter()
         self.account = AccountManager(self.client, self.rules, self.store)
-        self.exe = ExecutionEngine(self.client, self.account, self.rules, self.store)
+        self.ledger = FillLedger(LEDGER_FILE)
+        self.exe = ExecutionEngine(self.client, self.account, self.rules, self.store, self.ledger)
         self._last_periodic_reconcile_ms = 0
-        self.reconciler = Reconciler(self.client, self.store)
+        self.reconciler = Reconciler(self.client, self.store, self.ledger, self.rules)
         self.range_engines: List[RangeEngine] = []
         self.macd_engines: List[MacdEngine] = []
         self.last_hb = 0.0
@@ -2818,16 +3182,23 @@ class Bot:
                     INITIAL_BANKROLL_USD, INITIAL_OPERATION_NOTIONAL_USD,
                     BTC_INITIAL_BANKROLL_USD, BTC_INITIAL_OPERATION_NOTIONAL_USD,
                     RECOVERY_MULTIPLIER, MAX_RECOVERY_FAILURES)
-        logger.info("RECOVERY ENTRY MODEL V14 | MARTINGALE/RECOVERY=REATIVO_AO_SINAL; nao fica como ordem de entrada pendente na exchange")
+        logger.info("RECOVERY ENTRY MODEL V15 | MARTINGALE/RECOVERY=REATIVO_AO_SINAL; nao fica como ordem de entrada pendente na exchange")
         logger.info("EXITS | RANGE_TP=%s RANGE_STOP=%s | MACD_TP=%s MACD_STOP=%s | RANGE_RECOVERY=4X_MIN+DYNAMIC_NET",
                     RANGE_TAKE_PROFIT_PCT, RANGE_HARD_STOP_PCT,
                     MACD_TAKE_PROFIT_PCT, MACD_HARD_STOP_PCT)
         logger.info("NEWS 3-STAR=%s | janela=-%sm/+%sm | fail_closed=%s", NEWS_FILTER_ENABLED, NEWS_WINDOW_BEFORE_MIN, NEWS_WINDOW_AFTER_MIN, NEWS_FAIL_CLOSED)
         logger.info("SAME_SYMBOL_MULTI_STRATEGY=%s | NATIVE_PROTECTIVE_ORDERS=%s workingType=%s",
                     ALLOW_MULTI_STRATEGY_SAME_SYMBOL, NATIVE_PROTECTIVE_ORDERS, PROTECTIVE_WORKING_TYPE)
+        logger.info("V15 HARDENING | ledger=%s | news_stale_max=%ss | entry_price_max_age=%ss | reconcile=%ss",
+                    LEDGER_FILE, NEWS_MAX_STALE_SECONDS, MAX_PRICE_AGE_FOR_ENTRY_SECONDS, RECONCILE_INTERVAL_SECONDS)
+        logger.info("RISK CAPS | ETH/HYPE recovery=%s total_symbol=%s | BTC recovery=%s total_symbol=%s",
+                    MAX_RECOVERY_NOTIONAL_USD, MAX_TOTAL_SYMBOL_NOTIONAL_USD,
+                    BTC_MAX_RECOVERY_NOTIONAL_USD, BTC_MAX_TOTAL_SYMBOL_NOTIONAL_USD)
         logger.info("=" * 90)
         if (LIVE_TRADING or VALIDATE_API_ONLY) and (not USER_ADDRESS or not SIGNER_ADDRESS or not SIGNER_PRIVATE_KEY):
             raise RuntimeError("LIVE_TRADING=1 ou VALIDATE_API_ONLY=1 requer as tres credenciais da API Wallet V3")
+        if SELF_TEST_ON_STARTUP:
+            run_internal_regression_checks()
         self.client.sync_time()
         self.rules.refresh()
         if VALIDATE_API_ONLY:
@@ -2844,6 +3215,8 @@ class Bot:
         if LIVE_TRADING:
             self.account.ensure_modes()
             self.account.sync(force=True)
+            if LEDGER_RECONCILE_ON_STARTUP:
+                self.ledger.bootstrap_from_state(self.store)
             if EMERGENCY_CLOSE_ALL_AND_RESET:
                 self.emergency_close_all_and_reset()
             self.reconciler.reconcile()
@@ -2930,6 +3303,7 @@ class Bot:
         with self.store.lock:
             self.store.state = reset
             self.store.save()
+        self.ledger.reset()
         self.account.sync(force=True)
         logger.critical(
             "EMERGENCY RESET CONCLUIDO | id=%s | posicoes=0 | ordens=0 | estado zerado | novas entradas usam notional base configurado",
@@ -2975,9 +3349,11 @@ class Bot:
                 if m["symbol"] in SYMBOLS and m["tf"] in MACD_TIMEFRAMES:
                     parts.append(f"M:{m['symbol']}:{m['tf']}:eq={m['equity']},RD={m['recovery_deficit']},streak={m['loss_streak']},pos={'1' if m.get('position') else '0'},prot={int(bool(m.get('protect')))}")
             ks = self.store.state["kill_switch"]
-        logger.info("HEARTBEAT | wallet=%s avail=%s unreal=%s | kill=%s:%s | %s",
+            gate = self.store.state.get("trade_gate", {})
+        logger.info("HEARTBEAT | wallet=%s avail=%s unreal=%s | kill=%s:%s | entry_gate=%s:%s | ledger=%s | %s",
                     self.account.wallet_balance, self.account.available_balance, self.account.unrealized,
-                    ks.get("mode"), ks.get("reason"), " | ".join(parts))
+                    ks.get("mode"), ks.get("reason"), gate.get("open_allowed"), gate.get("reason"),
+                    self.ledger.open_by_symbol_side(), " | ".join(parts))
         with self.news._lock:
             news_events = len(self.news.events)
             news_source = self.news.last_source
@@ -3233,12 +3609,12 @@ class Bot:
                 # Quando físico e virtual voltarem a bater, libera SOMENTE o SOFT kill
                 # criado por POSITION_MISMATCH. Outros kills continuam intocados.
                 _now_reconcile = now_ms()
-                if _now_reconcile - self._last_periodic_reconcile_ms >= 15000:
+                if _now_reconcile - self._last_periodic_reconcile_ms >= int(RECONCILE_INTERVAL_SECONDS * 1000):
                     self._last_periodic_reconcile_ms = _now_reconcile
                     try:
                         self.reconciler.reconcile()
                     except Exception as _re:
-                        logger.warning("PERIODIC RECONCILE FAIL V14 | %s", _re)
+                        logger.warning("PERIODIC RECONCILE FAIL V15 | %s", _re)
 
                 for e in self.range_engines:
                     p = prices.get(e.symbol)
@@ -3261,6 +3637,8 @@ class Bot:
     def shutdown(self) -> None:
         logger.info("SHUTDOWN | salvando estado")
         self.store.save()
+        try: self.ledger.close()
+        except Exception: pass
         self.md.stop.set(); self.news.stop.set(); self.stop.set()
 
 
