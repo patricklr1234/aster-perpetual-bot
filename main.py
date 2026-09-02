@@ -110,7 +110,7 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "2.6.8-v12"
+VERSION = "2.6.9-v13"
 BOT_NAME = "ASTER_PERPETUAL_BOT_V3"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
@@ -1456,9 +1456,38 @@ class ExecutionEngine:
                                   "close": rec, "at": now_iso()})
         return rec
 
+    def physical_position_qty(self, symbol: str, position_side: str) -> Decimal:
+        """Quantidade física realmente aberta na Aster para symbol+positionSide."""
+        if not LIVE_TRADING:
+            return D("1e50")
+        rows = self.client.positions()
+        for p in (rows if isinstance(rows, list) else []):
+            if str(p.get("symbol", "")).upper() != str(symbol).upper():
+                continue
+            if str(p.get("positionSide", "")).upper() != str(position_side).upper():
+                continue
+            return abs(dec(p.get("positionAmt")))
+        return D(0)
+
     def close_leg(self, strategy_id: str, symbol: str, leg: Dict[str, Any],
-                  ref_price: Decimal, reason: str) -> Dict[str, Any]:
-        qty = dec(leg["qty"])
+                  ref_price: Decimal, reason: str,
+                  max_physical_qty: Optional[Decimal] = None) -> Optional[Dict[str, Any]]:
+        wanted = dec(leg["qty"])
+        qty = wanted
+        if LIVE_TRADING:
+            physical = self.physical_position_qty(symbol, str(leg["side"]))
+            if max_physical_qty is not None:
+                physical = min(physical, max(D(0), dec(max_physical_qty)))
+            qty = min(wanted, physical)
+            step = self.rules.rules[symbol].step_size
+            qty = floor_step(qty, step)
+            if qty <= 0:
+                logger.warning(
+                    "CLOSE LEG SKIP V13 | %s | %s %s | wanted=%s physical_available=%s | "
+                    "motivo=POSICAO_FISICA_JA_ENCERRADA_OU_RESERVADA_PARA_OUTRA_ESTRATEGIA",
+                    strategy_id, symbol, leg.get("side"), wanted, physical,
+                )
+                return None
         fill = self.market(strategy_id, symbol, leg["side"], qty, False, ref_price)
         closed_qty = min(qty, fill["qty"])
         return self._close_record(strategy_id, symbol, leg, closed_qty, fill["price"], reason,
@@ -1471,6 +1500,8 @@ class ExecutionEngine:
         for leg in list(legs):
             try:
                 c = self.close_leg(strategy_id, symbol, leg, ref_price, reason)
+                if c is None:
+                    continue
                 closes.append(c)
                 total += dec(c["pnl_est"])
             except Exception as e:
@@ -1840,6 +1871,117 @@ class RangeEngine:
     def st(self) -> Dict[str, Any]:
         return self.store.state["range"][self.symbol]
 
+    def _other_strategy_reserved_qty(self, position_side: str) -> Decimal:
+        """Reserva quantidade física atribuída a MACDs do mesmo símbolo/lado.
+
+        A Aster agrega posições por symbol+positionSide. O RANGE nunca deve tentar
+        fechar uma quantidade física que pertence logicamente a outro motor.
+        """
+        total = D(0)
+        with self.store.lock:
+            for mst in self.store.state.get("macd", {}).values():
+                mst = mst or {}
+                if str(mst.get("symbol", "")).upper() != self.symbol:
+                    continue
+                pos = mst.get("position") or {}
+                leg = pos.get("leg") or {}
+                if str(leg.get("side", "")).upper() != str(position_side).upper():
+                    continue
+                total += dec(leg.get("qty"))
+        return total
+
+    def _range_physical_capacity(self, position_side: str) -> Decimal:
+        actual = self.exe.physical_position_qty(self.symbol, position_side)
+        reserved = self._other_strategy_reserved_qty(position_side)
+        return max(D(0), actual - reserved)
+
+    def _reconcile_range_ghost_legs(self, b: Dict[str, Any], price: Decimal) -> bool:
+        """Remove do RANGE apenas a parcela virtual que já não existe fisicamente.
+
+        Retorna True quando o basket inteiro ficou sem posição física e foi
+        reconciliado/encerrado no state. Não inventa PNL para um fill cujo order-id
+        já foi perdido; preserva equity/RD e registra explicitamente a reconciliação.
+        """
+        if not LIVE_TRADING:
+            return False
+        legs = list(b.get("legs") or [])
+        if not legs:
+            return False
+
+        changed = False
+        rebuilt: List[Dict[str, Any]] = []
+        by_side_capacity = {
+            "LONG": self._range_physical_capacity("LONG"),
+            "SHORT": self._range_physical_capacity("SHORT"),
+        }
+        used = {"LONG": D(0), "SHORT": D(0)}
+
+        for leg in legs:
+            side = str(leg.get("side", "")).upper()
+            qty = dec(leg.get("qty"))
+            if side not in ("LONG", "SHORT") or qty <= 0:
+                continue
+            available = max(D(0), by_side_capacity[side] - used[side])
+            keep = min(qty, available)
+            step = self.exe.rules.rules[self.symbol].step_size
+            keep = floor_step(keep, step)
+            if keep <= 0:
+                changed = True
+                logger.warning(
+                    "RANGE GHOST LEG REMOVIDA V13 | %s | side=%s leg=%s virtual_qty=%s "
+                    "physical_capacity=%s reserved_other=%s",
+                    self.symbol, side, leg.get("id"), qty, by_side_capacity[side],
+                    self._other_strategy_reserved_qty(side),
+                )
+                continue
+            if keep < qty:
+                changed = True
+                new_leg = dict(leg)
+                new_leg["qty"] = str(keep)
+                new_leg["notional"] = str(keep * dec(new_leg.get("entry_price")))
+                leg = new_leg
+                logger.warning(
+                    "RANGE GHOST LEG REDUZIDA V13 | %s | side=%s leg=%s old_qty=%s new_qty=%s",
+                    self.symbol, side, leg.get("id"), qty, keep,
+                )
+            rebuilt.append(leg)
+            used[side] += keep
+
+        if not changed:
+            return False
+
+        self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+        self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
+        if b.get("native_bracket"):
+            self.exe.cancel_bracket(self.symbol, b.get("native_bracket"))
+        b["native_basket_exit"] = None
+        b["native_basket_stop"] = None
+        b["native_bracket"] = None
+        b["legs"] = rebuilt
+
+        st = self.st()
+        if not rebuilt:
+            st["basket"] = None
+            st["status"] = "PROTECT" if dec(st.get("recovery_deficit")) > 0 else "IDLE"
+            st["anchor"] = str(price)
+            st["protect_anchor"] = str(price) if st["status"] == "PROTECT" else None
+            st["last_result"] = "RECONCILED_ALREADY_CLOSED"
+            st["last_update"] = now_iso()
+            self.store.save()
+            release_owner(self.store, self.symbol, self.id)
+            logger.warning(
+                "RANGE BASKET RECONCILIADO V13 | %s | nenhuma quantidade RANGE restante na Aster | "
+                "status=%s equity_preservada=%s RD_preservado=%s",
+                self.symbol, st["status"], st.get("equity"), st.get("recovery_deficit"),
+            )
+            return True
+
+        # Se restaram pernas, a última perna física preservada passa a ser a ativa.
+        b["active_side"] = str(rebuilt[-1].get("side"))
+        st["last_update"] = now_iso()
+        self.store.save()
+        return False
+
     def _new_anchor(self, price: Decimal) -> None:
         st = self.st()
         st["anchor"] = str(price)
@@ -1975,7 +2117,23 @@ class RangeEngine:
         self.exe.cancel_bracket(self.symbol, b.get("native_bracket"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
         self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
-        pnl, closes = self.exe.close_legs(self.id, self.symbol, b.get("legs", []), price, reason)
+        # V13: em posição física agregada, fecha somente a capacidade pertencente ao RANGE.
+        closes = []
+        pnl = D(0)
+        reserved_used = {"LONG": D(0), "SHORT": D(0)}
+        for _leg in list(b.get("legs", [])):
+            _side = str(_leg.get("side", "")).upper()
+            _reserved_other = self._other_strategy_reserved_qty(_side)
+            _actual = self.exe.physical_position_qty(self.symbol, _side)
+            _available_range = max(D(0), _actual - _reserved_other - reserved_used.get(_side, D(0)))
+            _c = self.exe.close_leg(
+                self.id, self.symbol, _leg, price, reason,
+                max_physical_qty=_available_range,
+            )
+            if _c is not None:
+                closes.append(_c)
+                pnl += dec(_c.get("pnl_est"))
+                reserved_used[_side] = reserved_used.get(_side, D(0)) + dec(_c.get("qty"))
         before = dec(st.get("equity"))
         after = before + pnl
         st["equity"] = str(after)
@@ -2201,7 +2359,7 @@ class RangeEngine:
                         tol = max(tick * D(2), _re * D("0.000001"))
                         if abs(stored_rtp - expected_rtp) > tol or abs(stored_rsl - expected_rsl) > tol:
                             logger.warning(
-                                "RANGE RECOVERY PRICE MIGRATION V12 | %s | side=%s entry=%s | "
+                                "RANGE RECOVERY PRICE MIGRATION V13 | %s | side=%s entry=%s | "
                                 "old_tp=%s old_sl=%s -> new_tp=%s new_sl=%s",
                                 self.symbol, active_recovery_side, _re,
                                 stored_rtp, stored_rsl, expected_rtp, expected_rsl,
@@ -2217,8 +2375,59 @@ class RangeEngine:
                 rtp = dec(b.get("recovery_tp_price"))
                 rsl = dec(b.get("recovery_stop_price"))
 
-                # V9/V10: estado persistido não é prova de que a ordem ainda existe na corretora.
-                # Confirma TP e SL nativos contra /openOrders e reinstala o lado ausente.
+                # V13: PRIMEIRO consulta os IDs persistidos para descobrir se TP/SL
+                # já foi executado. Só depois verifica openOrders/reinstala. Isso evita
+                # apagar o ID de uma ordem FILLED antes de contabilizar seu fill.
+                native_result = None
+                if b.get("native_basket_exit"):
+                    native_result = self.exe.consume_basket_exit(
+                        self.id, self.symbol, b.get("legs", []),
+                        b.get("native_basket_exit"), price,
+                        "NATIVE_RANGE_BASKET_TAKE_PROFIT",
+                    )
+                if native_result:
+                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
+                    pnl, closes = native_result
+                    before = dec(st.get("equity")); after = before + pnl
+                    rd_before = dec(st.get("recovery_deficit")); rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
+                    st["equity"] = str(after); st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl); st["recovery_deficit"] = str(rd_after)
+                    st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0); st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
+                    st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"; st["basket"] = None; st["failures"] = 0; st["status"] = "IDLE"
+                    st["anchor"] = str(price); st["protect_anchor"] = None; st["last_update"] = now_iso(); self.store.save(); release_owner(self.store, self.symbol, self.id)
+                    logger.info("RANGE NATIVE BASKET TP CLOSE V13 | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
+                    return
+
+                native_stop = None
+                if b.get("native_basket_stop"):
+                    native_stop = self.exe.consume_basket_exit(
+                        self.id, self.symbol, b.get("legs", []),
+                        b.get("native_basket_stop"), price,
+                        "NATIVE_RANGE_BASKET_STOP_LOSS",
+                    )
+                if native_stop:
+                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
+                    pnl, closes = native_stop
+                    before = dec(st.get("equity")); after = before + pnl
+                    rd_before = dec(st.get("recovery_deficit")); rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
+                    st["equity"] = str(after); st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl); st["recovery_deficit"] = str(rd_after)
+                    st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0); st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
+                    st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"; st["basket"] = None; st["status"] = "PROTECT"
+                    st["protect_anchor"] = str(price); st["anchor"] = str(price); st["last_update"] = now_iso(); self.store.save(); release_owner(self.store, self.symbol, self.id)
+                    logger.warning("RANGE NATIVE BASKET SL CLOSE V13 | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
+                    return
+
+                # Se uma versão anterior perdeu o ID do fill, reconcilia o state com
+                # a posição física sem tocar na quantidade reservada aos MACDs.
+                if self._reconcile_range_ghost_legs(b, price):
+                    return
+                b = st.get("basket")
+                if not b:
+                    return
+                active = b["active_side"]
+                rtp = dec(b.get("recovery_tp_price"))
+                rsl = dec(b.get("recovery_stop_price"))
+
+                # Agora sim: uma ordem ausente e NÃO FILLED pode ser reinstalada.
                 if NATIVE_PROTECTIVE_ORDERS and b.get("native_basket_exit") and not self.exe.basket_exit_is_live(self.symbol, b.get("native_basket_exit")):
                     self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
                     b["native_basket_exit"] = None
@@ -2234,7 +2443,7 @@ class RangeEngine:
                             self.id + ":TP", self.symbol, b.get("legs", []), rtp, price
                         )
                         self.store.save()
-                        logger.warning("RANGE BASKET TP REINSTALADO | %s | trigger=%s", self.symbol, rtp)
+                        logger.warning("RANGE BASKET TP REINSTALADO V13 | %s | trigger=%s", self.symbol, rtp)
                     except Exception as e:
                         logger.exception("RANGE BASKET TP REINSTALL FAIL | %s | %s", self.symbol, e)
                 if rsl > 0 and not b.get("native_basket_stop") and NATIVE_PROTECTIVE_ORDERS:
@@ -2243,39 +2452,9 @@ class RangeEngine:
                             self.id + ":SL", self.symbol, b.get("legs", []), rsl, price
                         )
                         self.store.save()
-                        logger.warning("RANGE BASKET SL REINSTALADO | %s | trigger=%s", self.symbol, rsl)
+                        logger.warning("RANGE BASKET SL REINSTALADO V13 | %s | trigger=%s", self.symbol, rsl)
                     except Exception as e:
                         logger.exception("RANGE BASKET SL REINSTALL FAIL | %s | %s", self.symbol, e)
-
-                native_result = None
-                if b.get("native_basket_exit"):
-                    native_result = self.exe.consume_basket_exit(self.id, self.symbol, b.get("legs", []), b.get("native_basket_exit"), price, "NATIVE_RANGE_BASKET_TAKE_PROFIT")
-                if native_result:
-                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_stop"))
-                    pnl, closes = native_result
-                    before = dec(st.get("equity")); after = before + pnl
-                    rd_before = dec(st.get("recovery_deficit")); rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
-                    st["equity"] = str(after); st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl); st["recovery_deficit"] = str(rd_after)
-                    st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0); st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
-                    st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"; st["basket"] = None; st["failures"] = 0; st["status"] = "IDLE"
-                    st["anchor"] = str(price); st["protect_anchor"] = None; st["last_update"] = now_iso(); self.store.save(); release_owner(self.store, self.symbol, self.id)
-                    logger.info("RANGE NATIVE BASKET TP CLOSE | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
-                    return
-
-                native_stop = None
-                if b.get("native_basket_stop"):
-                    native_stop = self.exe.consume_basket_exit(self.id, self.symbol, b.get("legs", []), b.get("native_basket_stop"), price, "NATIVE_RANGE_BASKET_STOP_LOSS")
-                if native_stop:
-                    self.exe.cancel_basket_exit(self.symbol, b.get("native_basket_exit"))
-                    pnl, closes = native_stop
-                    before = dec(st.get("equity")); after = before + pnl
-                    rd_before = dec(st.get("recovery_deficit")); rd_after = rd_before + (-pnl) if pnl < 0 else max(D(0), rd_before - pnl)
-                    st["equity"] = str(after); st["realized_pnl"] = str(dec(st.get("realized_pnl")) + pnl); st["recovery_deficit"] = str(rd_after)
-                    st["wins"] = int(st.get("wins", 0)) + (1 if pnl > 0 else 0); st["losses"] = int(st.get("losses", 0)) + (1 if pnl < 0 else 0)
-                    st["last_result"] = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"; st["basket"] = None; st["status"] = "PROTECT"
-                    st["protect_anchor"] = str(price); st["anchor"] = str(price); st["last_update"] = now_iso(); self.store.save(); release_owner(self.store, self.symbol, self.id)
-                    logger.warning("RANGE NATIVE BASKET SL CLOSE | %s | pnl=%s equity=%s RD=%s", self.symbol, pnl, after, rd_after)
-                    return
 
                 if rtp > 0 and ((active == "LONG" and price >= rtp) or (active == "SHORT" and price <= rtp)):
                     self._close_basket(price, "RECOVERY_LEG_TP_1PCT_CLOSE_ALL", protect_after=False); return
@@ -2826,31 +3005,37 @@ class Bot:
         logical: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
 
         def add_logical(symbol: str, side: str, strategy: str, vqty: Decimal,
-                        target: Any = "-", stop: Any = "-", recovery: Any = "-") -> None:
+                        target: Any = "-", stop: Any = "-", recovery: Any = "-",
+                        virtual_entry: Any = "-") -> None:
             symbol = str(symbol).upper()
             side = str(side).upper()
             if symbol not in SYMBOLS or side not in ("LONG", "SHORT") or vqty <= 0:
                 return
             logical.setdefault((symbol, side), []).append({
                 "strategy": strategy, "qty": vqty, "target": target,
-                "stop": stop, "recovery": recovery,
+                "stop": stop, "recovery": recovery, "entry": virtual_entry,
             })
 
         for symbol, rst in state_range.items():
             basket = (rst or {}).get("basket") or {}
             legs = basket.get("legs") or []
             grouped: Dict[str, Decimal] = {}
+            weighted_entry: Dict[str, Decimal] = {}
             for leg in legs:
                 side = str(leg.get("side", "")).upper()
                 q = dec(leg.get("qty"))
+                ep = dec(leg.get("entry_price"))
                 if side in ("LONG", "SHORT") and q > 0:
                     grouped[side] = grouped.get(side, D(0)) + q
+                    weighted_entry[side] = weighted_entry.get(side, D(0)) + q * ep
             for side, q in grouped.items():
+                ventry = weighted_entry.get(side, D(0)) / q if q > 0 else D(0)
                 add_logical(
                     symbol, side, f"RANGE:{symbol}", q,
                     basket.get("recovery_tp_price") or basket.get("tp_price") or "-",
                     basket.get("hard_stop_price") or "-",
                     basket.get("alternations", 0),
+                    ventry,
                 )
 
         for key, mst in state_macd.items():
@@ -2867,6 +3052,7 @@ class Bot:
                     pos.get("tp_price") or "-",
                     pos.get("stop_price") or "-",
                     pos.get("recovery_level", mst.get("recovery_level", mst.get("loss_streak", 0))),
+                    leg.get("entry_price") or "-",
                 )
 
         for p in (positions if isinstance(positions, list) else []):
@@ -2940,6 +3126,7 @@ class Bot:
                 virtual_lot_parts.append(
                     f"{x['strategy']}:{side}"
                     f"|qty={dstr(x_qty, 8)}"
+                    f"|entry={x.get('entry','-')}"
                     f"|notional_usd={dstr(x_notional, 8)}"
                     f"|mode={x_mode}"
                     f"|recovery_level={x_recovery}"
