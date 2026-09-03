@@ -108,8 +108,8 @@ UTC = timezone.utc
 # CONFIG
 # -----------------------------------------------------------------------------
 
-VERSION = "5.2.0-v16-native-trailing-watchdog"
-BOT_NAME = "ASTER_PERPETUAL_BOT_V16"
+VERSION = "5.3.0-v17-ledger-auto-repair"
+BOT_NAME = "ASTER_PERPETUAL_BOT_V17"
 BASE_URL = os.getenv("ASTER_BASE_URL", "https://fapi.asterdex.com").rstrip("/")
 WS_BASE = os.getenv("ASTER_WS_BASE", "wss://fstream.asterdex.com").rstrip("/")
 USER_ADDRESS = os.getenv("ASTER_USER_ADDRESS", "").strip()
@@ -209,6 +209,7 @@ MAX_PRICE_AGE_FOR_ENTRY_SECONDS = float(os.getenv("MAX_PRICE_AGE_FOR_ENTRY_SECON
 RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "10"))
 LEDGER_RECONCILE_ON_STARTUP = os.getenv("LEDGER_RECONCILE_ON_STARTUP", "1") == "1"
 SELF_TEST_ON_STARTUP = os.getenv("SELF_TEST_ON_STARTUP", "1") == "1"
+AUTO_REPAIR_ZERO_PHYSICAL_LEDGER = os.getenv("AUTO_REPAIR_ZERO_PHYSICAL_LEDGER", "1") == "1"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -1269,6 +1270,23 @@ class FillLedger:
             row = self.db.execute("SELECT COALESCE(SUM(CAST(open_qty AS REAL)),0) FROM lots WHERE strategy_id=? AND symbol=? AND position_side=? AND CAST(open_qty AS REAL)>0",
                                   (strategy_id, symbol, side)).fetchone()
         return dec(row[0] if row else 0)
+
+    def zero_open_lots_for_symbol(self, symbol: str, reason: str = "EXCHANGE_ZERO_RECONCILE") -> int:
+        """Close only ledger lots for a symbol after exchange confirms BOTH hedge sides are zero."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT leg_id FROM lots WHERE symbol=? AND CAST(open_qty AS REAL)>0", (symbol,)
+            ).fetchall()
+            if not rows:
+                return 0
+            t = now_ms()
+            self.db.execute(
+                "UPDATE lots SET open_qty='0', closed_ms=? WHERE symbol=? AND CAST(open_qty AS REAL)>0",
+                (t, symbol),
+            )
+            self.db.commit()
+        logger.warning("LEDGER AUTO-REPAIR V17 | symbol=%s | ghost_lots_closed=%s | reason=%s", symbol, len(rows), reason)
+        return len(rows)
 
     def bootstrap_from_state(self, store: 'StateStore') -> int:
         with self.lock:
@@ -3037,14 +3055,55 @@ class Reconciler:
             if abs(e - a) >= step:
                 mismatches.append((k, e, a))
         if mismatches:
-            reason = f"POSITION_MISMATCH_LEDGER expected_vs_actual={mismatches}"
-            self.store.set_trade_gate(False, reason)
-            current_ks = self.store.state.get("kill_switch", {}) or {}
-            desired = "HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
-            if str(current_ks.get("mode")) != desired or str(current_ks.get("reason")) != reason:
-                self.store.kill(desired, reason)
-            logger.error(f"RECONCILE V16 | BLOQUEADO | {reason}")
-            return False
+            # V17: repair a very specific stale-ledger condition. We only repair a symbol when
+            # the exchange authoritatively reports BOTH LONG and SHORT physical quantities as zero.
+            # This preserves history (lots are marked closed, never deleted) and cannot trim a live position.
+            repaired_symbols = []
+            if AUTO_REPAIR_ZERO_PHYSICAL_LEDGER:
+                for sym in SYMBOLS:
+                    exp_long = expected.get((sym, "LONG"), D(0))
+                    exp_short = expected.get((sym, "SHORT"), D(0))
+                    act_long = actual.get((sym, "LONG"), D(0))
+                    act_short = actual.get((sym, "SHORT"), D(0))
+                    if (exp_long > 0 or exp_short > 0) and act_long == 0 and act_short == 0:
+                        # Cancel stale protective orders for a flat symbol before clearing logical ghosts.
+                        try:
+                            self.client.cancel_all(sym)
+                        except Exception as e:
+                            logger.warning("RECONCILE V17 | cancel stale orders failed | %s | %s", sym, e)
+                        n = self.ledger.zero_open_lots_for_symbol(sym)
+                        if n:
+                            repaired_symbols.append(sym)
+                            with self.store.lock:
+                                r = self.store.state.get("range", {}).get(sym)
+                                if isinstance(r, dict) and r.get("basket"):
+                                    r["basket"] = None
+                                    r["status"] = "IDLE"
+                                    r["anchor"] = None
+                                    r["last_update"] = now_iso()
+                                for m in self.store.state.get("macd", {}).values():
+                                    if isinstance(m, dict) and str(m.get("symbol")) == sym and m.get("position"):
+                                        m["position"] = None
+                                        m["last_update"] = now_iso()
+                                self.store.save()
+                            logger.warning("RECONCILE V17 | AUTO-REPAIRED FLAT SYMBOL | %s | exchange LONG=0 SHORT=0", sym)
+                if repaired_symbols:
+                    expected = self.expected_by_symbol_side()
+                    mismatches = []
+                    for k in set(expected) | set(actual):
+                        e = expected.get(k, D(0)); a = actual.get(k, D(0))
+                        step = self.rules.rules[k[0]].step_size if k[0] in self.rules.rules else D("0.00000001")
+                        if abs(e - a) >= step:
+                            mismatches.append((k, e, a))
+            if mismatches:
+                reason = f"POSITION_MISMATCH_LEDGER expected_vs_actual={mismatches}"
+                self.store.set_trade_gate(False, reason)
+                current_ks = self.store.state.get("kill_switch", {}) or {}
+                desired = "HARD" if HARD_KILL_ON_POSITION_MISMATCH else "SOFT"
+                if str(current_ks.get("mode")) != desired or str(current_ks.get("reason")) != reason:
+                    self.store.kill(desired, reason)
+                logger.error(f"RECONCILE V17 | BLOQUEADO | {reason}")
+                return False
         self.store.set_trade_gate(True, None)
         cleared = self.store.clear_soft_position_mismatch()
         logger.info(f"RECONCILE V16 | OK | ledger={expected} physical={actual} | soft_mismatch_cleared={cleared}")
